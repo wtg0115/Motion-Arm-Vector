@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arm Vector 버전 기록</title>
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --ink:#1b1b1b; --sub:#666; --line:#e2e2de; --accent:#0b6bcb; --tag:#eef3fb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141414; --card:#1e1e1e; --ink:#ececec; --sub:#a0a0a0; --line:#2e2e2e; --accent:#6aa9ff; --tag:#1d2a3a; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.55 system-ui, -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:28px 16px 48px; }
+  h1 { font-size:1.45rem; margin:0 0 4px; }
+  p.lead { color:var(--sub); margin:0 0 20px; }
+  a { color:var(--accent); }
+  ol { list-style:none; padding:0; margin:0; display:grid; gap:10px; }
+  li { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  .top { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .ver { font-weight:700; font-size:1.05rem; text-decoration:none; }
+  .date { color:var(--sub); font-size:.88rem; }
+  .tag { background:var(--tag); color:var(--accent); font-size:.78rem; padding:2px 8px; border-radius:99px; }
+  .desc { margin:6px 0 0; font-size:.94rem; }
+  footer { margin-top:24px; color:var(--sub); font-size:.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Arm Vector 버전 기록</h1>
+  <p class="lead">카메라로 팔 움직임을 벡터로 읽어 로봇팔을 따라 움직이게 하는 프로젝트의 모든 버전이에요. 위가 최신이에요. <a href="../">최신 버전 바로 열기</a></p>
+  <ol>
+    <li><div class="top"><a class="ver" href="v10.1-first-live.html">v10.1 첫 실기 제한모드</a><span class="date">2026-07-16</span><span class="tag">최신</span></div>
+      <p class="desc">사람 관절 각도를 로봇 서보 각도로 바로 바꾸는 진짜 미러링. 오른팔 기준값 수집, PWM 켜기·긴급정지, 첫 실기용 움직임 제한.</p></li>
+    <li><div class="top"><a class="ver" href="v09.7-hand-gate.html">v9.7 손 게이트 완화 · 기준 잠금</a><span class="date">2026-07-15</span></div>
+      <p class="desc">손을 너무 쉽게 버리던 기준을 풀고, 1번 기준자세가 잠겨야 다음 단계로 넘어감. 빈 값(null)을 0으로 보던 버그 수정.</p></li>
+    <li><div class="top"><a class="ver" href="v08.7.0-joint-rom.html">v8.7.0 관절축 순차 가동범위</a><span class="date">2026-07-13</span></div>
+      <p class="desc">자세 등록, 진단 모드, 관절마다 최고 가동범위 측정. CH0~CH4 사용.</p></li>
+    <li><div class="top"><a class="ver" href="v07.5-robot-control.html">v7.5 Robot Control</a><span class="date">2026-07-08</span></div>
+      <p class="desc">v7.3에 인물 고정 기능 추가.</p></li>
+    <li><div class="top"><a class="ver" href="v07.3-robot-control.html">v7.3 Robot Control</a><span class="date">2026-07-08</span></div>
+      <p class="desc">브라우저에서 아두이노로 바로 연결(Web Serial)해 서보와 그리퍼를 움직이는 첫 로봇 제어판.</p></li>
+    <li><div class="top"><a class="ver" href="v04-multi-workers.html">Multi v4 (Workers)</a><span class="date">2026-06-12</span></div>
+      <p class="desc">자세 인식과 손 인식을 작업 스레드 두 개로 나눠 동시에 처리.</p></li>
+    <li><div class="top"><a class="ver" href="v03-multi.html">Multi v3</a><span class="date">2026-06-12</span></div>
+      <p class="desc">여러 사람과 손가락까지 인식하고, One Euro 필터로 떨림을 줄인 판.</p></li>
+  </ol>
+  <footer>카메라를 쓰기 때문에 꼭 이 웹 주소(https)로 여세요. 파일을 직접 열면 카메라가 막혀요.</footer>
+</main>
+</body>
+</html>

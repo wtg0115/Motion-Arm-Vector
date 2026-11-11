@@ -1,0 +1,2436 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Arm Vector v9.7 — 손게이트완화·기준잠금·null안전</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:system-ui,sans-serif; background:#0a0d12; color:#e8eef4;
+         height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
+  #stage { position:relative; flex:1; min-height:0; background:#000; overflow:hidden; }
+  video, canvas#overlay { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #stage.mirror video, #stage.mirror canvas#overlay { transform:scaleX(-1); }
+
+  canvas#view3d { position:absolute; top:12px; right:12px;
+                  width:240px; height:240px;
+                  background:rgba(8,11,18,.72);
+                  border:1px solid #25323f; border-radius:14px;
+                  backdrop-filter:blur(4px); }
+  #hud { position:absolute; top:12px; left:12px;
+         font:12px/1.6 ui-monospace,monospace;
+         background:rgba(8,11,18,.66); border:1px solid #1d2733;
+         border-radius:12px; padding:11px 14px;
+         pointer-events:none; white-space:pre;
+         backdrop-filter:blur(4px); }
+  #status { position:absolute; bottom:14px; left:0; right:0; text-align:center;
+            font-size:13px; color:#cfe0f0; text-shadow:0 1px 3px #000; padding:0 16px;
+            transition:opacity 0.4s; }
+  #bar { display:flex; gap:8px; padding:12px;
+         padding-bottom:calc(12px + env(safe-area-inset-bottom)); background:#0f141b;
+         flex-wrap:wrap; }
+  button { flex:1; min-width:120px; padding:13px 0; font-size:14px; font-weight:600;
+           color:#e8eef4; background:#1a2330; border:1px solid #28384a; border-radius:12px;
+           cursor:pointer; transition:background .12s; }
+  button:hover { background:#22303f; }
+  button:active { background:#2c3d4f; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.on { background:#1d3a2c; border-color:#2e6b4d; }
+  .c-upper { color:#ff9e57; }
+  .c-fore  { color:#7be0a8; }
+  .c-palm  { color:#a8b8ff; }
+  .c-yaw   { color:#ff7eaa; }
+  .c-fps   { color:#ffd479; }
+  .c-srv   { color:#6fd3e8; }
+  .c-lock  { color:#9dff8a; }
+  .c-arm   { color:#ffd479; }
+  .c-active{ color:#5cf2c0; }
+  .c-diag  { color:#ff9edb; }
+  .c-rom   { color:#67e8f9; }
+  .c-rom2  { color:#facc15; }
+  .c-perf  { color:#8696a8; }
+  .dim     { color:#5e6b7a; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+  <canvas id="view3d" width="240" height="240"></canvas>
+  <div id="hud" hidden></div>
+  <div id="status">▶ 시작을 누르면 카메라·마이크 권한을 물어봐 (v9.5 · 등록자세 상대쿼터니언 · CH4 누적기 제거 · 손목 7자세 진단)</div>
+  <div style="padding:8px 12px;background:#101827;border-top:1px solid #33415a;color:#b9cbe2;font:12px ui-monospace,monospace">물리 정의: CH0 베이스 · CH1 숄더 · CH2 엘보우 · CH3 손목 상하 · CH4 손목 축회전 | 실제 출력은 하드웨어 보정 완료 전 잠금</div>
+</div>
+<div id="bar">
+  <button id="btnStart">▶ 시작</button>
+  <button id="btnFlip">카메라 전환</button>
+  <button id="btnArm">팔: 오른쪽</button>
+  <button id="btnMirror" class="on">좌우반전: 켬</button>
+  <button id="btnQuality">모델: Heavy</button>
+  <button id="btnLock">🔒 인물 고정</button>
+  <button id="btnCalib">📍 자세 등록</button>
+  <button id="btnDiag">🔬 진단 모드</button>
+  <button id="btnRom">📐 최고 가동범위</button>
+  <button id="btnRobot">🤖 로봇 연결</button>
+</div>
+
+<!-- ============================================================
+     워커 (클래식 — CommonJS 번들 eval)
+============================================================ -->
+<script type="text/js-worker" id="workerSrc">
+let landmarker = null;
+let kind = null;
+let busy = false;
+let lastTs = 0;
+
+self.onmessage = async (e) => {
+  const msg = e.data;
+
+  if (msg.type === "init") {
+    kind = msg.kind;
+    try {
+      const r = await fetch(msg.bundleUrl);
+      if (!r.ok) throw new Error("번들 다운로드 실패 HTTP " + r.status);
+      const code = await r.text();
+
+      // CommonJS 번들(.cjs) → exports/module 주입해서 eval
+      const moduleShim = { exports: {} };
+      (new Function("exports", "module", "self", "globalThis", code))(
+        moduleShim.exports, moduleShim, self, self
+      );
+      const lib = moduleShim.exports;
+      if (!lib || !lib.FilesetResolver) {
+        throw new Error("vision 객체를 못 찾음 (번들 구조 변경 가능성)");
+      }
+      const { FilesetResolver, PoseLandmarker, HandLandmarker } = lib;
+      const fileset = await FilesetResolver.forVisionTasks(msg.wasmRoot);
+
+      async function build(delegate) {
+        if (kind === "pose") {
+          return await PoseLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: msg.modelUrl, delegate },
+            runningMode: "VIDEO",
+            numPoses: 3,
+            minPoseDetectionConfidence: msg.opts.minDet,
+            minPosePresenceConfidence: msg.opts.minPres,
+            minTrackingConfidence: msg.opts.minTrack,
+            outputSegmentationMasks: false
+          });
+        }
+        return await HandLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: msg.modelUrl, delegate },
+          runningMode: "VIDEO",
+          numHands: 2,
+          minHandDetectionConfidence: msg.opts.minDet,
+          minHandPresenceConfidence: msg.opts.minPres,
+          minTrackingConfidence: msg.opts.minTrack
+        });
+      }
+
+      try {
+        landmarker = await build("GPU");
+        self.postMessage({ type: "ready", kind, delegate: "GPU" });
+      } catch (gpuErr) {
+        landmarker = await build("CPU");
+        self.postMessage({ type: "ready", kind, delegate: "CPU" });
+      }
+    } catch (err) {
+      self.postMessage({ type: "error", kind, message: String(err && err.message || err) });
+    }
+    return;
+  }
+
+  if (msg.type === "frame" && landmarker && !busy) {
+    busy = true;
+    let bmp = msg.bitmap;
+    try {
+      let ts = msg.ts;
+      if (ts <= lastTs) ts = lastTs + 1;
+      lastTs = ts;
+
+      const t0 = performance.now();
+      const result = landmarker.detectForVideo(bmp, ts);
+      const t1 = performance.now();
+
+      self.postMessage({
+        type: "result",
+        kind,
+        result: {
+          landmarks: result.landmarks || [],
+          worldLandmarks: result.worldLandmarks || [],
+          handedness: result.handedness || result.handednesses || []
+        },
+        ms: t1 - t0
+      });
+    } catch (err) {
+      self.postMessage({ type: "error", kind, message: String(err && err.message || err) });
+    } finally {
+      try { bmp && bmp.close && bmp.close(); } catch (e) {}
+      busy = false;
+    }
+  }
+};
+</script>
+
+<script type="module">
+// ════════════════════════════════════════════════════════
+// 설정 — 0.10.35 (최신 안정판), heavy 모델
+// ════════════════════════════════════════════════════════
+const VER = "0.10.35";
+const WASM_ROOT  = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}/wasm`;
+const BUNDLE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}/vision_bundle.cjs`;
+
+const POSE_MODELS = {
+  heavy: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+  full:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+};
+const HAND_MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// 신뢰도 — 높을수록 헛검출↓, 안정↑ (노트북 고품질이라 약간 높게)
+const CONF = { minDet: 0.6, minPres: 0.6, minTrack: 0.6 };
+
+const POSE_IDX = { LSh:11, RSh:12, LElb:13, RElb:14, LWr:15, RWr:16, LHip:23, RHip:24 };
+// 손 모델은 손목 자세축을 만들기 위한 4점만 사용한다.
+// 손가락 끝, 손 벌림, 집기, 개폐 상태는 읽지도 계산하지도 않는다.
+const HAND_IDX = { Wr:0, IndexMcp:5, MiddleMcp:9, PinkyMcp:17 };
+// 화면 표시도 손바닥 기준 프레임만 그린다. 개별 손가락 동작은 완전히 무시한다.
+const HAND_FRAME_BONES = [[0,5],[5,9],[9,17],[17,0],[5,17]];
+
+let currentArm = "right";
+let mirrorOn = true;
+let quality = "heavy";
+
+// ── 인물 락(Lock) 상태 ──
+// locked=false: 화면에서 제일 가까운(큰) 사람 자동 추적
+// locked=true : lockSig 지문과 일치하는 사람만 추적, 타인 무시
+let personLocked = false;
+let lockSig = null;      // 락된 사람의 지문 {cx, cy, shoulderW}
+let lockLostFrames = 0;  // 락된 사람을 못 찾은 연속 프레임 수
+let lastTrackPos = null; // 직전 프레임 추적 인물의 어깨 중점 (교체 감지용, 인덱스는 불안정)
+
+// ════════════════════════════════════════════════════════
+// 3D 벡터 유틸
+// ════════════════════════════════════════════════════════
+const V = {
+  sub:(a,b)=>({x:a.x-b.x,y:a.y-b.y,z:a.z-b.z}),
+  add:(a,b)=>({x:a.x+b.x,y:a.y+b.y,z:a.z+b.z}),
+  scale:(a,s)=>({x:a.x*s,y:a.y*s,z:a.z*s}),
+  dot:(a,b)=>a.x*b.x+a.y*b.y+a.z*b.z,
+  cross:(a,b)=>({x:a.y*b.z-a.z*b.y, y:a.z*b.x-a.x*b.z, z:a.x*b.y-a.y*b.x}),
+  len:(a)=>Math.hypot(a.x,a.y,a.z),
+  norm:(a)=>{const L=V.len(a); return L<1e-9?{x:0,y:0,z:0}:V.scale(a,1/L);},
+  angle:(a,b)=>{
+    const c=Math.max(-1,Math.min(1,V.dot(V.norm(a),V.norm(b))));
+    return Math.acos(c)*180/Math.PI;
+  },
+  // 로드리게스 회전: v를 axis 둘레로 deg만큼 회전
+  rotateAround:(v,axis,deg)=>{
+    const k=V.norm(axis), th=deg*Math.PI/180;
+    const c=Math.cos(th), s=Math.sin(th);
+    return V.add(V.add(V.scale(v,c), V.scale(V.cross(k,v),s)),
+                 V.scale(k, V.dot(k,v)*(1-c)));
+  },
+  // axis 둘레로 a→b 부호있는 각 (-180~180)
+  signedAngle:(a,b,axis)=>{
+    const ax=V.norm(axis);
+    const ap=V.norm(V.sub(a,V.scale(ax,V.dot(a,ax))));
+    const bp=V.norm(V.sub(b,V.scale(ax,V.dot(b,ax))));
+    if(V.len(ap)<1e-6||V.len(bp)<1e-6) return 0;
+    let ang=V.angle(ap,bp);
+    if(V.dot(V.cross(ap,bp),ax)<0) ang=-ang;
+    return ang;
+  },
+  // 각도차를 -180~180으로
+  wrap180:(d)=>{
+    while(d>180) d-=360;
+    while(d<-180) d+=360;
+    return d;
+  }
+};
+
+// ════════════════════════════════════════════════════════
+// 회전행렬·쿼터니언 유틸 — 손 좌표계 ↔ 전완 좌표계 상대회전
+// q 형식: {w,x,y,z}. q와 -q는 같은 회전이므로 프레임 연속성 보정이 필요함.
+// ════════════════════════════════════════════════════════
+const Q={
+  norm:(q)=>{const n=Math.hypot(q.w,q.x,q.y,q.z)||1;return {w:q.w/n,x:q.x/n,y:q.y/n,z:q.z/n};},
+  neg:(q)=>({w:-q.w,x:-q.x,y:-q.y,z:-q.z}),
+  dot:(a,b)=>a.w*b.w+a.x*b.x+a.y*b.y+a.z*b.z,
+  conj:(q)=>({w:q.w,x:-q.x,y:-q.y,z:-q.z}),
+  mul:(a,b)=>({
+    w:a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z,
+    x:a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
+    y:a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,
+    z:a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w
+  }),
+  fromMat:(m)=>{
+    const tr=m[0][0]+m[1][1]+m[2][2]; let w,x,y,z;
+    if(tr>0){const S=Math.sqrt(tr+1)*2;w=.25*S;x=(m[2][1]-m[1][2])/S;y=(m[0][2]-m[2][0])/S;z=(m[1][0]-m[0][1])/S;}
+    else if(m[0][0]>m[1][1]&&m[0][0]>m[2][2]){const S=Math.sqrt(1+m[0][0]-m[1][1]-m[2][2])*2;w=(m[2][1]-m[1][2])/S;x=.25*S;y=(m[0][1]+m[1][0])/S;z=(m[0][2]+m[2][0])/S;}
+    else if(m[1][1]>m[2][2]){const S=Math.sqrt(1+m[1][1]-m[0][0]-m[2][2])*2;w=(m[0][2]-m[2][0])/S;x=(m[0][1]+m[1][0])/S;y=.25*S;z=(m[1][2]+m[2][1])/S;}
+    else{const S=Math.sqrt(1+m[2][2]-m[0][0]-m[1][1])*2;w=(m[1][0]-m[0][1])/S;x=(m[0][2]+m[2][0])/S;y=(m[1][2]+m[2][1])/S;z=.25*S;}
+    return Q.norm({w,x,y,z});
+  },
+  rotVecDeg:(q)=>{
+    q=Q.norm(q); if(q.w<0) q=Q.neg(q);
+    const sv=Math.hypot(q.x,q.y,q.z);
+    if(sv<1e-8) return {x:0,y:0,z:0};
+    const ang=2*Math.atan2(sv,Math.max(-1,Math.min(1,q.w)))*180/Math.PI;
+    return {x:q.x/sv*ang,y:q.y/sv*ang,z:q.z/sv*ang};
+  }
+};
+function frameMat(xAxis,yAxis,zAxis){
+  return [[xAxis.x,yAxis.x,zAxis.x],[xAxis.y,yAxis.y,zAxis.y],[xAxis.z,yAxis.z,zAxis.z]];
+}
+function matTransposeMul(a,b){
+  return Array.from({length:3},(_,r)=>Array.from({length:3},(_,c)=>a[0][r]*b[0][c]+a[1][r]*b[1][c]+a[2][r]*b[2][c]));
+}
+
+// ════════════════════════════════════════════════════════
+// One Euro Filter (3D) — 고품질이라 더 부드럽게 튜닝
+// ════════════════════════════════════════════════════════
+class OneEuro3D {
+  constructor(minCutoff=1.0, beta=0.007, dCutoff=1.0){
+    this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff;
+    this.x=null; this.dx={x:0,y:0,z:0}; this.t=null;
+  }
+  alpha(cutoff,dt){const r=2*Math.PI*cutoff*dt; return r/(r+1);}
+  filter(p,t){
+    if(this.x===null){this.x={x:p.x,y:p.y,z:p.z}; this.t=t; return {...this.x};}
+    const dt=Math.max(1e-3,(t-this.t)/1000); this.t=t;
+    const dxRaw={x:(p.x-this.x.x)/dt, y:(p.y-this.x.y)/dt, z:(p.z-this.x.z)/dt};
+    const aD=this.alpha(this.dCutoff,dt);
+    this.dx={x:aD*dxRaw.x+(1-aD)*this.dx.x, y:aD*dxRaw.y+(1-aD)*this.dx.y, z:aD*dxRaw.z+(1-aD)*this.dx.z};
+    const speed=V.len(this.dx);
+    const cutoff=this.minCutoff+this.beta*speed;
+    const a=this.alpha(cutoff,dt);
+    this.x={x:a*p.x+(1-a)*this.x.x, y:a*p.y+(1-a)*this.x.y, z:a*p.z+(1-a)*this.x.z};
+    return {...this.x};
+  }
+  reset(){this.x=null; this.dx={x:0,y:0,z:0}; this.t=null;}
+}
+class OneEuro1D {
+  constructor(minCutoff=1.0, beta=0.01){ this.f=new OneEuro3D(minCutoff,beta); }
+  filter(v,t){ return this.f.filter({x:v,y:0,z:0},t).x; }
+  reset(){ this.f.reset(); }
+}
+
+const filters = {
+  shoulder:new OneEuro3D(), elbow:new OneEuro3D(), wrist:new OneEuro3D(), otherShoulder:new OneEuro3D(),
+  shScreen:new OneEuro3D(0.7,0.004), elScreen:new OneEuro3D(0.7,0.004), wrScreen:new OneEuro3D(0.7,0.004),
+  handWr:new OneEuro3D(), handIdx:new OneEuro3D(), handPky:new OneEuro3D(), handMid:new OneEuro3D(),
+  wristSideSmooth:new OneEuro1D(0.8,0.006), shoulderLRSmooth:new OneEuro1D(0.8,0.006),
+  wristUDSmooth:new OneEuro1D(0.8,0.006), wristTwistSmooth:new OneEuro1D(0.8,0.006)
+};
+const handScreenFilters = Array.from({length:21}, ()=>new OneEuro3D(0.7,0.004));
+function resetAllFilters(){
+  for(const k in filters) filters[k].reset();
+  handScreenFilters.forEach(f=>f.reset());
+  if(typeof shoulderLRTrackerReset==="function") shoulderLRTrackerReset();  // 어깨 좌우 연속각도 리셋
+  if(typeof resetHandQualityState==="function") resetHandQualityState();
+  if(typeof resetWristFrameState==="function") resetWristFrameState();
+}
+
+// ════════════════════════════════════════════════════════
+// DOM
+// ════════════════════════════════════════════════════════
+const $cam=document.getElementById("cam");
+const $overlay=document.getElementById("overlay");
+const $view3d=document.getElementById("view3d");
+const $hud=document.getElementById("hud");
+const $status=document.getElementById("status");
+const $stage=document.getElementById("stage");
+const $btnStart=document.getElementById("btnStart");
+const $btnFlip=document.getElementById("btnFlip");
+const $btnArm=document.getElementById("btnArm");
+const $btnMirror=document.getElementById("btnMirror");
+const $btnQuality=document.getElementById("btnQuality");
+const $btnLock=document.getElementById("btnLock");
+const $btnCalib=document.getElementById("btnCalib");
+const $btnRobot=document.getElementById("btnRobot");
+const $btnDiag=document.getElementById("btnDiag");
+const $btnRom=document.getElementById("btnRom");
+const ctx=$overlay.getContext("2d");
+const ctx3d=$view3d.getContext("2d");
+
+// ════════════════════════════════════════════════════════
+// 워커
+// ════════════════════════════════════════════════════════
+let poseWorker=null, handWorker=null;
+let poseReady=false, handReady=false, poseBusy=false, handBusy=false;
+let lastPose=null, lastHands=null, poseMs=0, handMs=0;
+let poseDelegate="?", handDelegate="?";
+
+function makeWorker(){
+  const src=document.getElementById("workerSrc").textContent;
+  const blob=new Blob([src],{type:"application/javascript"});
+  return new Worker(URL.createObjectURL(blob));
+}
+function spawnWorkers(){
+  if(poseWorker) poseWorker.terminate();
+  if(handWorker) handWorker.terminate();
+  poseReady=handReady=poseBusy=handBusy=false;
+  lastPose=lastHands=null;
+
+  poseWorker=makeWorker(); handWorker=makeWorker();
+  poseWorker.onmessage=onWorkerMessage("pose");
+  handWorker.onmessage=onWorkerMessage("hand");
+
+  poseWorker.postMessage({type:"init",kind:"pose",bundleUrl:BUNDLE_URL,wasmRoot:WASM_ROOT,
+    modelUrl:POSE_MODELS[quality],opts:CONF});
+  handWorker.postMessage({type:"init",kind:"hand",bundleUrl:BUNDLE_URL,wasmRoot:WASM_ROOT,
+    modelUrl:HAND_MODEL,opts:CONF});
+}
+function onWorkerMessage(label){
+  return (e)=>{
+    const d=e.data;
+    if(d.type==="ready"){
+      if(label==="pose"){poseReady=true; poseDelegate=d.delegate;}
+      else {handReady=true; handDelegate=d.delegate;}
+      checkReady();
+    } else if(d.type==="result"){
+      if(d.kind==="pose"){lastPose=d.result; poseMs=d.ms; poseBusy=false;}
+      else {lastHands=d.result; handMs=d.ms; handBusy=false;}
+    } else if(d.type==="error"){
+      $status.style.opacity=1;
+      $status.textContent=`${d.kind} worker 오류: ${d.message}`;
+      console.error(d);
+    }
+  };
+}
+function checkReady(){
+  if(poseReady&&handReady){
+    $status.textContent=`준비 완료 (pose:${poseDelegate} / hand:${handDelegate}) — ▶ 시작`;
+    if(running){ $status.style.opacity=0; }
+    else setTimeout(()=>{$status.style.opacity=0.5;},1400);
+  }
+}
+spawnWorkers();
+
+// ════════════════════════════════════════════════════════
+// 카메라
+// ════════════════════════════════════════════════════════
+let stream=null, facing="user", running=false;
+
+async function startCamera(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  try{
+    // 카메라 + 마이크 동시 요청 (박수 트리거용)
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:facing, width:{ideal:1280}, height:{ideal:720} },
+      audio:true
+    });
+    $cam.srcObject=stream;
+    applyMirror();
+    await $cam.play();
+    if(!$cam.videoWidth){
+      await new Promise(res=>{ $cam.onloadedmetadata=res; setTimeout(res,1000); });
+    }
+    resizeCanvases();
+    resetAllFilters();
+    // 박수 감지 시작 (마이크가 있으면)
+    initClapDetection(stream);
+    $hud.hidden=false;
+    $status.style.opacity=0;
+    running=true;
+    requestAnimationFrame(loop);
+  }catch(err){
+    // 마이크 거부됐어도 카메라만으로 재시도
+    if(String(err.name)==="NotAllowedError" || String(err).includes("audio")){
+      try{
+        stream=await navigator.mediaDevices.getUserMedia({
+          video:{ facingMode:facing, width:{ideal:1280}, height:{ideal:720} }, audio:false
+        });
+        $cam.srcObject=stream; applyMirror(); await $cam.play();
+        if(!$cam.videoWidth){ await new Promise(res=>{ $cam.onloadedmetadata=res; setTimeout(res,1000); }); }
+        resizeCanvases(); resetAllFilters();
+        $hud.hidden=false; $status.style.opacity=0; running=true;
+        setStatus("⚠ 마이크 거부됨 — 박수 트리거 비활성, 키보드만 사용 가능");
+        setTimeout(()=>{$status.style.opacity=0;},2500);
+        requestAnimationFrame(loop);
+        return;
+      }catch(e2){
+        setStatus("카메라 실패: "+e2.message); return;
+      }
+    }
+    $status.style.opacity=1;
+    $status.textContent="카메라 실패: "+err.message;
+  }
+}
+
+// ── 박수 감지 (오디오 급격한 피크 = 박수) ──
+let audioCtx=null, clapAnalyser=null, clapData=null, clapActive=false;
+let clapTimes=[];          // 최근 박수 시각들
+let clapEnergyPrev=0;
+function initClapDetection(mediaStream){
+  const tracks=mediaStream.getAudioTracks();
+  if(tracks.length===0){ clapActive=false; return; }
+  try{
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    const src=audioCtx.createMediaStreamSource(mediaStream);
+    clapAnalyser=audioCtx.createAnalyser();
+    clapAnalyser.fftSize=512;
+    clapAnalyser.smoothingTimeConstant=0.1;
+    src.connect(clapAnalyser);
+    clapData=new Uint8Array(clapAnalyser.frequencyBinCount);
+    clapActive=true;
+  }catch(e){ clapActive=false; }
+}
+// 매 프레임 호출: 박수 개수 감지해서 콜백
+function pollClaps(){
+  if(!clapActive||!clapAnalyser) return;
+  clapAnalyser.getByteFrequencyData(clapData);
+  // 전체 에너지 (고주파 위주로 박수 특성 강조)
+  let energy=0;
+  for(let i=clapData.length*0.3|0;i<clapData.length;i++) energy+=clapData[i];
+  energy/=(clapData.length*0.7);
+
+  const now=performance.now();
+  // 급격한 상승 = 박수 (임계값 + 직전보다 크게 증가 + 쿨다운)
+  if(energy>CLAP_THRESHOLD && energy-clapEnergyPrev>CLAP_RISE){
+    if(clapTimes.length===0 || now-clapTimes[clapTimes.length-1]>CLAP_MIN_GAP){
+      clapTimes.push(now);
+    }
+  }
+  clapEnergyPrev=energy;
+
+  // 오래된 박수 기록 제거 (박수 묶음 판정 윈도우)
+  clapTimes=clapTimes.filter(t=>now-t<CLAP_WINDOW);
+}
+// 박수 파라미터 (튜닝 가능)
+const CLAP_THRESHOLD=90;   // 박수로 칠 최소 에너지 (0~255)
+const CLAP_RISE=35;        // 직전 대비 상승폭
+const CLAP_MIN_GAP=150;    // 박수 사이 최소 간격(ms) — 중복 방지
+const CLAP_WINDOW=1500;    // 이 시간 안의 박수를 한 묶음으로 셈(ms)
+function applyMirror(){
+  // 전면(user)일 때만 반전 의미 있음. 사용자 토글과 합쳐서 결정
+  const shouldMirror = mirrorOn && facing==="user";
+  $stage.classList.toggle("mirror", shouldMirror);
+}
+function resizeCanvases(){
+  const rect=$overlay.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  $overlay.width=Math.round(rect.width*dpr);
+  $overlay.height=Math.round(rect.height*dpr);
+}
+function normToCanvas(nx,ny){
+  const cw=$overlay.width, ch=$overlay.height;
+  const vw=$cam.videoWidth||1280, vh=$cam.videoHeight||720;
+  if(!vw||!vh) return {x:nx*cw,y:ny*ch};
+  const scale=Math.max(cw/vw,ch/vh);
+  const dispW=vw*scale, dispH=vh*scale;
+  return { x:(cw-dispW)/2 + nx*dispW, y:(ch-dispH)/2 + ny*dispH };
+}
+
+// ════════════════════════════════════════════════════════
+// 데이터 추출
+// ════════════════════════════════════════════════════════
+// ── 인물 선택: 여러 후보 중 추적할 사람의 인덱스 결정 ──
+// 각 사람의 '지문' = 어깨 중점 위치 + 어깨 너비 (화면 정규좌표 기준)
+function personSignature(sl){
+  const ls=sl[POSE_IDX.LSh], rs=sl[POSE_IDX.RSh];
+  if(!ls||!rs) return null;
+  const cx=(ls.x+rs.x)/2, cy=(ls.y+rs.y)/2;
+  const shoulderW=Math.hypot(ls.x-rs.x, ls.y-rs.y);
+  return { cx, cy, shoulderW };
+}
+
+function choosePersonIndex(pose){
+  if(!pose||!pose.landmarks||pose.landmarks.length===0) return -1;
+  const n=pose.landmarks.length;
+
+  // 각 후보의 지문 계산
+  const sigs=[];
+  for(let i=0;i<n;i++){
+    const s=personSignature(pose.landmarks[i]);
+    sigs.push(s);
+  }
+
+  if(!personLocked){
+    // 락 안 걸림 → 제일 큰(가까운) 사람 = 어깨너비 최대
+    let best=-1, bestW=-1;
+    for(let i=0;i<n;i++){
+      if(sigs[i] && sigs[i].shoulderW>bestW){ bestW=sigs[i].shoulderW; best=i; }
+    }
+    return best;
+  }
+
+  // 락 걸림 → lockSig와 가장 비슷한 사람 찾기
+  if(!lockSig){ return -1; }
+  let best=-1, bestScore=1e9;
+  // 놓친 시간이 길수록 위치 조건 완화 (사람이 이동 후 복귀할 수 있게)
+  // 0프레임=위치 엄격, 60프레임+=위치 거의 무시하고 체격(어깨너비)으로만 매칭
+  const posWeight=Math.max(0.15, 1 - lockLostFrames/60);
+  for(let i=0;i<n;i++){
+    if(!sigs[i]) continue;
+    const dPos=Math.hypot(sigs[i].cx-lockSig.cx, sigs[i].cy-lockSig.cy);
+    const dSize=Math.abs(sigs[i].shoulderW-lockSig.shoulderW);
+    const score=dPos*posWeight + dSize*1.2;
+    if(score<bestScore){ bestScore=score; best=i; }
+  }
+
+  // 수락 임계값도 놓친 시간에 비례해 완화
+  const accept=0.25 + Math.min(0.35, lockLostFrames*0.01);
+  if(bestScore>accept){
+    lockLostFrames++;
+    return -1;  // 이번 프레임은 아무도 안 잡음 (엉뚱한 사람 잡느니 대기)
+  }
+
+  // 매칭 성공 → 지문 갱신(사람이 움직이니까 서서히 따라감) + 위치 기억
+  lockLostFrames=0;
+  lockSig.cx = lockSig.cx*0.7 + sigs[best].cx*0.3;
+  lockSig.cy = lockSig.cy*0.7 + sigs[best].cy*0.3;
+  lockSig.shoulderW = lockSig.shoulderW*0.7 + sigs[best].shoulderW*0.3;
+  return best;
+}
+
+function extractArm(pose, arm, t){
+  if(!pose||!pose.worldLandmarks||pose.worldLandmarks.length===0) return null;
+  const pIdx=choosePersonIndex(pose);
+  if(pIdx<0){ lastTrackPos=null; return null; }
+  const wl=pose.worldLandmarks[pIdx], sl=pose.landmarks[pIdx];
+  if(!wl||!sl) return null;
+
+  // 추적 대상 교체 감지: 어깨 중점이 한 프레임에 크게 점프하면 다른 사람으로 넘어간 것
+  // (인덱스는 프레임마다 뒤바뀔 수 있어 위치로 판단)
+  const sig=personSignature(sl);
+  if(sig){
+    if(lastTrackPos){
+      const jump=Math.hypot(sig.cx-lastTrackPos.cx, sig.cy-lastTrackPos.cy);
+      if(jump>0.15){  // 화면의 15% 이상 순간이동 = 사람 교체
+        resetAllFilters();
+      }
+    }
+    lastTrackPos={cx:sig.cx, cy:sig.cy};
+  }
+
+  const R=arm==="right";
+  const shW=wl[R?POSE_IDX.RSh:POSE_IDX.LSh];
+  const elW=wl[R?POSE_IDX.RElb:POSE_IDX.LElb];
+  const wrW=wl[R?POSE_IDX.RWr:POSE_IDX.LWr];
+  const oshW=wl[R?POSE_IDX.LSh:POSE_IDX.RSh];
+  const shS=sl[R?POSE_IDX.RSh:POSE_IDX.LSh];
+  const elS=sl[R?POSE_IDX.RElb:POSE_IDX.LElb];
+  const wrS=sl[R?POSE_IDX.RWr:POSE_IDX.LWr];
+  const oshS=sl[R?POSE_IDX.LSh:POSE_IDX.RSh];
+
+  // MediaPipe visibility/presence가 낮은 프레임은 ROM 측정에서 제외할 수 있게 품질값 전달
+  const lmConf=(p)=>{
+    if(!p) return 0;
+    const v=typeof p.visibility==="number"?p.visibility:1;
+    const pr=typeof p.presence==="number"?p.presence:1;
+    return Math.min(v,pr);
+  };
+  const trackConfidence=Math.min(lmConf(shS),lmConf(elS),lmConf(wrS),lmConf(oshS));
+
+  const sh=filters.shoulder.filter(shW,t);
+  const el=filters.elbow.filter(elW,t);
+  const wr=filters.wrist.filter(wrW,t);
+  const osh=filters.otherShoulder.filter(oshW,t);
+
+  const shScreen=filters.shScreen.filter({x:shS.x,y:shS.y,z:0},t);
+  const elScreen=filters.elScreen.filter({x:elS.x,y:elS.y,z:0},t);
+  const wrScreen=filters.wrScreen.filter({x:wrS.x,y:wrS.y,z:0},t);
+
+  const upper=V.sub(el,sh);
+  const fore=V.sub(wr,el);
+  const shLine=V.sub(osh,sh);
+
+  // ── 몸통 좌표계 (양 어깨 기반) — 모든 각도의 안정적 기준 ──
+  // ★2026-07-15 수정: bodyZ 부호 버그★
+  //   옛 코드: bodyZ = cross(bodyX, 아래)
+  //   bodyX가 팔에 따라 뒤집히므로 bodyZ도 같이 뒤집혔다.
+  //   → 왼팔에선 우연히 '앞'이 됐지만 오른팔에선 '뒤'를 가리켰다 (주석은 '몸 앞방향'이라고 써 있었다).
+  //   결과: 오른팔로 "팔 앞으로 뻗기"를 하면 raw0 = ±180° = 연속 누적기의 wrap 경계.
+  //         제일 흔한 자세가 정확히 경계에 앉아 ±360° 점프가 쌓였다.
+  //         실측 검증: forward 자세 raw0 = 183.3° (예측 180.0°) — 일치.
+  //   수정: bodyZ/bodyY는 팔과 무관한 shDir로 만들고, bodyX만 팔에 따라 뒤집는다.
+  //         이제 raw0 원점 = 팔 앞, wrap 경계 = 팔 뒤(어깨가 못 가는 방향).
+  const shDir = V.norm(shLine);                              // 항상 오른어깨→왼어깨
+  let bodyZ = V.cross({x:0,y:1,z:0}, shDir);                 // 몸 앞
+  if(V.len(bodyZ)<1e-6) bodyZ={x:0,y:0,z:-1};                // 퇴화 방지
+  bodyZ = V.norm(bodyZ);
+  const bodyY = V.norm(V.cross(shDir, bodyZ));               // 아래
+  const bodyX = (arm==="right") ? shDir : V.scale(shDir,-1); // 팔에 따라 좌우 부호 통일
+
+  // ── 관절축 정의 ──
+  // CH0: 상완의 좌우 회전. 상완을 몸통 가로축(bodyX)-앞축(bodyZ) 평면에 투영해 계산한다.
+  //      몸통 자체의 yaw는 사용하지 않는다. 팔이 완전히 수직이면 수평 투영이 작아져 이전값을 유지한다.
+  // CH1: 상완의 상하 움직임. 몸통 아래축(bodyY)과 상완의 각도이며 아래=0°, 수평=90°, 위=180°.
+  // CH2: 기존과 동일한 팔꿈치 굽힘량. 편 상태=0°, 접을수록 증가.
+  const upperN=V.norm(upper);
+  const shoulderLRX=V.dot(upperN,bodyX);
+  const shoulderLRZ=V.dot(upperN,bodyZ);
+  const shoulderLRHorizontal=Math.hypot(shoulderLRX,shoulderLRZ);
+  const shoulderLRRaw=Math.atan2(shoulderLRX,shoulderLRZ)*180/Math.PI;
+
+  const elbowInternal=V.angle(V.scale(upper,-1),fore);
+  const elbowFlexion=180-elbowInternal;
+  const shoulderUpDown=V.angle(upper,bodyY);
+
+  return { sh,el,wr,osh, upper,fore,shLine,
+           bodyX,bodyY,bodyZ,
+           elbowInternal,elbowFlexion,
+           shoulderLRRaw,shoulderLRHorizontal,shoulderUpDown,
+           // 이전 진단 코드 호환용 별칭
+           shoulderAbduction:shoulderUpDown,
+           trackConfidence,
+           screen:{sh:shScreen,el:elScreen,wr:wrScreen} };
+}
+
+const handQualityState={prevFwd:null,prevSide:null,prevT:0,baseFwdLen:null,baseSideLen:null};
+function resetHandQualityState(){
+  handQualityState.prevFwd=null; handQualityState.prevSide=null; handQualityState.prevT=0;
+  handQualityState.baseFwdLen=null; handQualityState.baseSideLen=null;
+}
+function scoreNear(value,target,tolerance){ return Math.max(0,1-Math.abs(value-target)/tolerance); }
+
+// v9.7: 손 선택 게이트. 손-팔손목점 화면거리가 이보다 크면 손을 버린다.
+// v9.6의 0.16은 너무 빡빡해 팔 배치가 조금만 달라도 전 프레임을 버렸다.
+const HAND_PICK_GATE=0.28;
+function extractHand(hands, arm, t, armWristNorm){
+  if(!hands||!hands.worldLandmarks||hands.worldLandmarks.length===0){
+    resetHandQualityState(); resetWristFrameState(); return null;
+  }
+  const nHands=hands.worldLandmarks.length;
+  let pickIdx=0, bestDist=Infinity;
+
+  // handedness.score는 왼손/오른손 분류 확률이지 랜드마크 정확도가 아니다.
+  // 실제 품질은 Pose 손목과의 거리, 손뼈 비율, 축 연속성으로 별도 계산한다.
+  if(armWristNorm){
+    for(let i=0;i<nHands;i++){
+      const sc=hands.landmarks[i]; if(!sc) continue;
+      const hw=sc[HAND_IDX.Wr];
+      const d=Math.hypot(hw.x-armWristNorm.x,hw.y-armWristNorm.y);
+      if(d<bestDist){bestDist=d;pickIdx=i;}
+    }
+    // v9.7: 게이트 0.16→0.28 완화. 팔 배치가 조금 달라져 손-팔손목점이 화면상 멀어져도
+    // 손을 버리지 않는다(v9.6에서 이 게이트가 전 프레임 손을 버린 진범). 단 0.28을 넘으면
+    // 다른 사람 손이나 배경 오검출로 보고 여전히 거부한다. 거리는 wristDistance로 노출해
+    // handQuality의 wristScore로 반영하고, 멀면 품질이 떨어져 자연히 걸러진다.
+    if(bestDist>HAND_PICK_GATE){
+      filters.handWr.reset(); filters.handIdx.reset(); filters.handPky.reset(); filters.handMid.reset();
+      handScreenFilters.forEach(f=>f.reset()); resetHandQualityState(); return null;
+    }
+  }else if(nHands>1){
+    const wantSide=(arm==="right")?"Left":"Right";
+    for(let i=0;i<nHands;i++){
+      const hd=hands.handedness[i];
+      const label=(Array.isArray(hd)?hd[0]?.categoryName:hd?.categoryName)||"";
+      if(label===wantSide){pickIdx=i;break;}
+    }
+  }
+
+  const hlWorld=hands.worldLandmarks[pickIdx];
+  const hlScreen=hands.landmarks[pickIdx];
+  if(!hlWorld||!hlScreen) return null;
+  const pickedHd=hands.handedness[pickIdx];
+  const pickedCat=Array.isArray(pickedHd)?pickedHd[0]:pickedHd;
+  const handednessScore=typeof pickedCat?.score==="number"?pickedCat.score:null;
+
+  // 품질 계산은 필터 전 원시 뼈 길이/직교성으로 한다.
+  const rw=hlWorld[HAND_IDX.Wr], ri=hlWorld[HAND_IDX.IndexMcp], rp=hlWorld[HAND_IDX.PinkyMcp], rm=hlWorld[HAND_IDX.MiddleMcp];
+  const rawFwd=V.sub(rm,rw), rawSide=V.sub(rp,ri);
+  const rawFwdLen=V.len(rawFwd), rawSideLen=V.len(rawSide);
+  const rawFwdN=V.norm(rawFwd), rawSideN=V.norm(rawSide);
+  const orthScore=Math.max(0,1-Math.abs(V.dot(rawFwdN,rawSideN))/0.65);
+
+  if(handQualityState.baseFwdLen==null){handQualityState.baseFwdLen=rawFwdLen;handQualityState.baseSideLen=rawSideLen;}
+  const boneScore=Math.min(
+    scoreNear(rawFwdLen,handQualityState.baseFwdLen,Math.max(.012,handQualityState.baseFwdLen*.45)),
+    scoreNear(rawSideLen,handQualityState.baseSideLen,Math.max(.012,handQualityState.baseSideLen*.45))
+  );
+  if(boneScore>.45){
+    handQualityState.baseFwdLen=handQualityState.baseFwdLen*.98+rawFwdLen*.02;
+    handQualityState.baseSideLen=handQualityState.baseSideLen*.98+rawSideLen*.02;
+  }
+
+  let continuityScore=1;
+  if(handQualityState.prevFwd&&handQualityState.prevSide){
+    const dt=Math.max(.016,(t-handQualityState.prevT)/1000);
+    const turn=Math.max(V.angle(rawFwdN,handQualityState.prevFwd),V.angle(rawSideN,handQualityState.prevSide));
+    const allowed=25+220*dt;
+    continuityScore=Math.max(0,1-Math.max(0,turn-allowed)/70);
+  }
+  handQualityState.prevFwd=rawFwdN; handQualityState.prevSide=rawSideN; handQualityState.prevT=t;
+  const wristScore=Number.isFinite(bestDist)?Math.max(0,1-bestDist/HAND_PICK_GATE):0.8;
+  const handQuality=Math.max(0,Math.min(1,wristScore*.40+orthScore*.20+boneScore*.25+continuityScore*.15));
+
+  const wr=filters.handWr.filter(rw,t);
+  const idx=filters.handIdx.filter(ri,t);
+  const pky=filters.handPky.filter(rp,t);
+  const mid=filters.handMid.filter(rm,t);
+
+  const fwd=V.norm(V.sub(mid,wr));
+  // 좌우 팔을 바꿔도 같은 해부학적 방향이 되도록 손바닥 가로축 순서를 통일한다.
+  let side=(arm==="right")?V.sub(pky,idx):V.sub(idx,pky);
+  side=V.norm(V.sub(side,V.scale(fwd,V.dot(side,fwd))));
+  const frameNormal=V.norm(V.cross(fwd,side));
+  let normal=frameNormal;                      // 표시용 법선은 기존 좌우손 규약 유지
+  if(arm!=="left") normal=V.scale(normal,-1);
+
+  const screen=hlScreen.map((p,i)=>{
+    const f=handScreenFilters[i].filter({x:p.x,y:p.y,z:0},t);
+    return {x:f.x,y:f.y};
+  });
+  let anchored=screen;
+  if(armWristNorm){
+    const hWrScreen=screen[HAND_IDX.Wr];
+    const dx=armWristNorm.x-hWrScreen.x,dy=armWristNorm.y-hWrScreen.y;
+    anchored=screen.map(p=>({x:p.x+dx,y:p.y+dy}));
+  }
+
+  return {wr,idx,pky,mid,fwd,side,frameNormal,normal,palmDir:fwd,
+          quality:handQuality,handednessScore,wristDistance:Number.isFinite(bestDist)?bestDist:null,
+          worldLm:hlWorld,screen,anchored};
+}
+
+// ════════════════════════════════════════════════════════
+// 메인 루프
+// ════════════════════════════════════════════════════════
+let lastSendTs=0, frameClock=0;
+let fpsCount=0, fpsTime=performance.now(), fpsVal=0;
+
+function loop(ts){
+  if(!running) return;
+  if($cam.readyState>=2 && ts-lastSendTs>16){  // 최대 ~60fps 디스패치
+    frameClock+=1;
+    const stamp=frameClock;
+    if(poseReady&&!poseBusy){
+      poseBusy=true;
+      createImageBitmap($cam).then(bmp=>{
+        poseWorker.postMessage({type:"frame",bitmap:bmp,ts:stamp},[bmp]);
+      }).catch(()=>{poseBusy=false;});
+    }
+    if(handReady&&!handBusy){
+      handBusy=true;
+      createImageBitmap($cam).then(bmp=>{
+        handWorker.postMessage({type:"frame",bitmap:bmp,ts:stamp},[bmp]);
+      }).catch(()=>{handBusy=false;});
+    }
+    lastSendTs=ts;
+  }
+  render(ts);
+
+  // ── 박수 감지 + 트리거 처리 ──
+  pollClaps();
+  handleClapTriggers(ts);
+
+  fpsCount++;
+  if(ts-fpsTime>=500){ fpsVal=fpsCount*1000/(ts-fpsTime); fpsCount=0; fpsTime=ts; }
+  requestAnimationFrame(loop);
+}
+
+// 박수 개수에 따른 트리거: 2번=시동토글, 3~4번=대기
+let lastClapAction=0;
+function handleClapTriggers(ts){
+  if(!clapActive) return;
+  // 박수 묶음이 안정될 때까지 잠깐 기다렸다 판정
+  if(clapTimes.length===0) return;
+  const now=performance.now();
+  const lastClap=clapTimes[clapTimes.length-1];
+  // 마지막 박수 후 CLAP_SETTLE 지나면 개수 확정
+  if(now-lastClap < CLAP_SETTLE) return;
+  const n=clapTimes.length;
+  clapTimes=[];  // 소비
+  if(now-lastClapAction < 800) return;  // 액션 쿨다운
+  lastClapAction=now;
+
+  if(n===2){
+    toggleArm();           // 박수 2번 = 시동/대기 토글
+  } else if(n>=3){
+    disarmSystem();        // 박수 3~4번 = 대기(정지)
+  }
+}
+const CLAP_SETTLE=500;   // 마지막 박수 후 이 시간 지나면 묶음 확정(ms)
+
+// ════════════════════════════════════════════════════════
+// 손목 상대회전 v9.5
+// 1) 현재 손-전완 절대 상대회전 qRel을 계산한다.
+// 2) 등록자세에서 저장한 wristReferenceQuat에 대한 qDelta를 먼저 만든다.
+// 3) qDelta를 swing/twist로 분해한다.
+// CH3 = 등록자세 대비 swing X, CH4 = 등록자세 대비 twist Z.
+// CH4는 등록자세(0°) → 하늘 방향 한쪽 약 90°만 사용하므로 연속 누적기를 쓰지 않는다.
+// ════════════════════════════════════════════════════════
+let lastWristFrameQuality=null, lastWristFrameFallback=false;
+let prevWristRelQuat=null;
+let lastWristAbsoluteQuat=null;
+let wristReferenceQuat=null;
+let lastWristTwistAngle=null,lastWristSideBendAngle=null,lastHandQuality=null;
+const WRIST_REF_STORAGE_KEY='armvec_wrist_refquat_v97';
+try{
+  const saved=JSON.parse(localStorage.getItem(WRIST_REF_STORAGE_KEY)||'null');
+  if(saved&&[saved.w,saved.x,saved.y,saved.z].every(Number.isFinite)) wristReferenceQuat=Q.norm(saved);
+}catch(e){}
+function resetWristOutputFilters(){
+  filters.wristUDSmooth.reset();
+  filters.wristSideSmooth.reset();
+  filters.wristTwistSmooth.reset();
+  lastWristTwistAngle=null;lastWristSideBendAngle=null;
+}
+function resetWristFrameState(){
+  lastWristFrameQuality=null; lastWristFrameFallback=false;
+  prevWristRelQuat=null;lastWristAbsoluteQuat=null;
+  resetWristOutputFilters();
+}
+function setWristReferenceFromCurrent(){
+  if(!lastWristAbsoluteQuat) return false;
+  wristReferenceQuat=Q.norm({...lastWristAbsoluteQuat});
+  try{localStorage.setItem(WRIST_REF_STORAGE_KEY,JSON.stringify(wristReferenceQuat));}catch(e){}
+  prevWristRelQuat=wristReferenceQuat;
+  resetWristOutputFilters();
+  return true;
+}
+function clearWristReference(){
+  wristReferenceQuat=null;
+  try{localStorage.removeItem(WRIST_REF_STORAGE_KEY);}catch(e){}
+  resetWristFrameState();
+}
+function computeWristKinematics(arm,hand,ts){
+  if(!arm||!hand) return {upDown:null,twist:null,sideBend:null,frameQuality:0,frameFallback:true,referenceReady:false};
+  const fa=V.norm(arm.fore);
+  // downRef 건강도: 전완이 수직에 가까우면 투영축이 붕괴한다.
+  let downRef=V.sub(arm.bodyY,V.scale(fa,V.dot(arm.bodyY,fa)));
+  const frameQuality=V.len(downRef);
+  let frameFallback=false;
+  if(frameQuality<.15){ frameFallback=true; downRef=V.sub(arm.bodyZ,V.scale(fa,V.dot(arm.bodyZ,fa))); }
+  if(V.len(downRef)<.15){ frameFallback=true; downRef=V.sub(arm.bodyX,V.scale(fa,V.dot(arm.bodyX,fa))); }
+  downRef=V.norm(downRef);
+  const upRef=V.scale(downRef,-1);
+  const sideRef=V.norm(V.cross(upRef,fa));
+
+  const Rfore=frameMat(sideRef,upRef,fa);
+  const Rhand=frameMat(hand.side,hand.frameNormal,hand.fwd);
+  let qRel=Q.fromMat(matTransposeMul(Rfore,Rhand));
+  if(prevWristRelQuat&&Q.dot(qRel,prevWristRelQuat)<0) qRel=Q.neg(qRel);
+  prevWristRelQuat=qRel;
+  lastWristAbsoluteQuat=qRel;
+
+  // 등록 전에는 화면을 안정적으로 유지하기 위해 항등 delta를 표시한다.
+  // 자세 등록 순간 qRel 자체를 wristReferenceQuat로 저장한다.
+  let qDelta={w:1,x:0,y:0,z:0};
+  const referenceReady=!!wristReferenceQuat;
+  if(referenceReady){
+    // reference → current 회전, 전완 좌표계에 표현한다.
+    // R_delta * R_reference = R_current 이므로 R_delta = R_current * R_reference^T.
+    // 따라서 quaternion도 qCurrent * conjugate(qReference) 순서여야 한다.
+    qDelta=Q.norm(Q.mul(qRel,Q.conj(wristReferenceQuat)));
+    // q와 -q는 같은 회전. 항상 최단 회전 가지를 선택한다.
+    if(qDelta.w<0) qDelta=Q.neg(qDelta);
+  }
+
+  let qTwist=Q.norm({w:qDelta.w,x:0,y:0,z:qDelta.z});
+  if(Math.hypot(qDelta.w,qDelta.z)<1e-7) qTwist={w:1,x:0,y:0,z:0};
+  const qSwing=Q.norm(Q.mul(qDelta,Q.conj(qTwist)));
+  const swingVec=Q.rotVecDeg(qSwing);
+  const rawTwist=V.wrap180(2*Math.atan2(qTwist.z,qTwist.w)*180/Math.PI);
+
+  const upDown=filters.wristUDSmooth.filter(swingVec.x,ts);
+  const sideBend=filters.wristSideSmooth.filter(swingVec.y,ts);
+  const twist=filters.wristTwistSmooth.filter(rawTwist,ts);
+  lastWristTwistAngle=twist;
+  lastWristSideBendAngle=sideBend;
+  return {upDown,twist,sideBend,sideRef,upRef,fa,frameQuality,frameFallback,
+          referenceReady,absoluteQuat:qRel,deltaQuat:qDelta};
+}
+// 기준축 건강도 임계값
+const WRIST_FRAME_MIN_REGISTER=0.40;  // 자세 등록 허용 하한 (전완 올림각 ~66° 이하)
+const WRIST_FRAME_MIN_WARN=0.30;      // 이 아래면 HUD 경고 (전완 올림각 ~72° 이상)
+function wristFrameVerdict(q){
+  if(q==null) return {label:"--",cls:"dim"};
+  if(q>=.50) return {label:`기준축 ${(q*100).toFixed(0)}% ✅`,cls:"dim"};
+  if(q>=WRIST_FRAME_MIN_WARN) return {label:`기준축 ${(q*100).toFixed(0)}% ⚠ 전완을 더 눕혀`,cls:"c-diag"};
+  return {label:`기준축 ${(q*100).toFixed(0)}% 🔴 붕괴 — 전완이 수직에 너무 가까움`,cls:"c-diag"};
+}
+
+// ════════════════════════════════════════════════════════
+// 렌더링
+// ════════════════════════════════════════════════════════
+function render(ts){
+  ctx.clearRect(0,0,$overlay.width,$overlay.height);
+  const arm=extractArm(lastPose,currentArm,ts);
+  // 팔의 손목 화면좌표를 손 선택에 넘겨 → 끼어든 손 무시
+  const armWristNorm = arm ? { x:arm.screen.wr.x, y:arm.screen.wr.y } : null;
+  const hand=extractHand(lastHands,currentArm,ts,armWristNorm);
+  lastHandQuality=hand?hand.quality:null;
+
+  if(arm){
+    const sh=normToCanvas(arm.screen.sh.x,arm.screen.sh.y);
+    const el=normToCanvas(arm.screen.el.x,arm.screen.el.y);
+    const wr=normToCanvas(arm.screen.wr.x,arm.screen.wr.y);
+    const dpr=window.devicePixelRatio||1;
+
+    // 손바닥 기준 프레임 — 손목을 팔 벡터 끝에 고정해서 그림
+    if(hand){
+      const hp = hand.anchored || hand.screen;
+      ctx.strokeStyle="rgba(168,184,255,0.5)";
+      ctx.lineWidth=2*dpr;
+      ctx.lineCap="round";
+      for(const [a,b] of HAND_FRAME_BONES){
+        const pa=normToCanvas(hp[a].x,hp[a].y);
+        const pb=normToCanvas(hp[b].x,hp[b].y);
+        ctx.beginPath(); ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y); ctx.stroke();
+      }
+      for(const p of hp){
+        const pp=normToCanvas(p.x,p.y);
+        ctx.fillStyle="rgba(168,184,255,0.85)";
+        ctx.beginPath(); ctx.arc(pp.x,pp.y,2.5*dpr,0,Math.PI*2); ctx.fill();
+      }
+    }
+
+    drawArrow(ctx, sh, el, "#ff9e57", 8*dpr);
+    drawArrow(ctx, el, wr, "#7be0a8", 8*dpr);
+    drawJoint(ctx, sh, dpr); drawJoint(ctx, el, dpr); drawJoint(ctx, wr, dpr);
+
+    const wristKin=computeWristKinematics(arm,hand,ts);
+    const wristUpDownAngle=wristKin.upDown;
+    lastWristFrameQuality=wristKin.frameQuality;
+    lastWristFrameFallback=wristKin.frameFallback;
+    const wristTwistAngle=wristKin.twist;
+    const wristSideBendAngle=wristKin.sideBend;
+
+    // ── 상태 머신에 따른 로봇 제어 ──
+    // 손바닥 개폐나 손가락 자세는 입력에 존재하지 않는다.
+    const servos=mapToServos(arm, wristUpDownAngle, wristTwistAngle);
+    // 최고 가동범위 측정은 로봇 출력 없이, 기본자세 대비 Δ각도만 수집
+    if(romActive) romCollectSample(ts,arm,hand);
+    // 현재 raw 각도(매칭용)는 mapToServos가 lastRawAngles에 저장함
+    poseMatch=computePoseMatch(lastRawAngles);
+
+    // ── 진단용 상세 데이터 (3D 벡터 원시값) ──
+    if(diagActive){
+      const u=arm.upper, f=arm.fore;
+      lastDiagData={
+        upper_x:u.x, upper_y:u.y, upper_z:u.z, upper_len:V.len(u),
+        fore_x:f.x, fore_y:f.y, fore_z:f.z, fore_len:V.len(f),
+        elbowAngle:arm.elbowFlexion, elbowInternal:arm.elbowInternal,
+        shoulderUpDown:arm.shoulderUpDown,
+        shoulderLeftRight:lastRawAngles[0],
+        wristUpDown:wristUpDownAngle!=null?wristUpDownAngle:null,
+        wristSideBendDiagnostic:wristSideBendAngle!=null?wristSideBendAngle:null,
+        wristAxisTwist:wristTwistAngle!=null?wristTwistAngle:null,
+        wristFrameQuality:wristKin.frameQuality!=null?wristKin.frameQuality:null,
+        wristFrameFallback:wristKin.frameFallback?1:0,
+        handQuality:hand?hand.quality:null, handednessScore:hand?hand.handednessScore:null,
+        handDetected: hand?1:0,
+        // v9.7: 손 지표 3분리를 위한 원시값
+        //   handDetected      = extractHand가 손을 반환했나 (게이트 통과)
+        //   handQuality       = 반환된 손의 기하 품질 (0~1)
+        //   wristDistance     = 손-팔손목점 화면거리 (게이트 근접도)
+        handRawPresent: (lastHands&&lastHands.landmarks&&lastHands.landmarks.length>0)?1:0,
+        wristDistance: hand&&Number.isFinite(hand.wristDistance)?hand.wristDistance:null
+      };
+      diagCollectSample();
+    }
+
+    if(robotConnected && !romActive){
+      if(sysState==='active'){
+        // 추적 중: 팔 따라감
+        sendToRobot(servos);
+      } else if(sysState==='arming'){
+        // 시동 준비: 로봇을 실제로 측정한 시작 자세로 이동
+        sendToRobot([...ROBOT_STOW_POSE]);
+        // 일치도가 임계 넘고 일정시간 유지되면 → 시동
+        if(poseMatch>=POSE_MATCH_THRESHOLD){
+          if(matchHoldStart===0) matchHoldStart=ts;
+          if(ts-matchHoldStart>=POSE_MATCH_HOLD){
+            // ★ 최초 1회 시동 ★
+            // 등록 순간의 사람 자세를 기준점으로 고정해 시동 순간 오차가 영점이 되지 않게 함
+            calibRef=[...refPose];
+            resetCommandSafety(ROBOT_STOW_POSE);
+            sysState='active';
+            matchHoldStart=0;
+            setStatus("✅ 시동! 자세 동기화 완료 — 이제 팔을 따라갑니다");
+            setTimeout(()=>{$status.style.opacity=0;},1800);
+          }
+        } else {
+          matchHoldStart=0;  // 자세 벗어나면 리셋
+        }
+      }
+      // 'idle'이면 아무것도 안 보냄 (로봇 정지 유지)
+    }
+
+    // ── 손목 벡터바 그리기 (전완 끝에서 손 방향으로) ──
+    if(hand && hand.anchored){
+      const wp=hand.anchored;  // 손목에 고정된 손 화면좌표
+      const hWr=normToCanvas(wp[HAND_IDX.Wr].x, wp[HAND_IDX.Wr].y);
+      const hMid=normToCanvas(wp[HAND_IDX.MiddleMcp].x, wp[HAND_IDX.MiddleMcp].y);
+      // 손목→중지뿌리 방향을 길게 늘여서 벡터바로
+      const vx=hMid.x-hWr.x, vy=hMid.y-hWr.y;
+      const len=Math.hypot(vx,vy)||1;
+      const scale=70*dpr/len;  // 화면상 길이 통일
+      const tip={x:hWr.x+vx*scale, y:hWr.y+vy*scale};
+      // 손목→중지 MCP 방향은 손목 상하축의 시각화일 뿐, 손가락 개폐 판정에는 쓰지 않는다.
+      drawArrow(ctx, hWr, tip, "#5fd3e8", 5*dpr);
+    }
+
+    const u=arm.upper, f=arm.fore;
+    const diagPose = diagActive ? DIAG_POSES[diagIdx] : null;
+    let diagBanner="";
+    if(diagActive){
+      const needsHand=(diagPose.focus||[]).includes("손");
+      // v9.7: 손 지표 실시간 3분리 표시
+      let handLine="";
+      if(needsHand){
+        const raw=(lastHands&&lastHands.landmarks&&lastHands.landmarks.length>0);
+        const q=hand?(hand.quality??0):0;
+        const wd=hand&&Number.isFinite(hand.wristDistance)?hand.wristDistance.toFixed(2):'--';
+        if(!raw)      handLine=`<span class="c-diag">손: ❌검출안됨 — 손을 화각 안에</span>\n`;
+        else if(!hand)handLine=`<span class="c-diag">손: 검출✅ 게이트✗ 거리${wd} — 손을 팔끝에</span>\n`;
+        else if(q<DIAG_HAND_QUALITY_MIN)handLine=`<span class="c-diag">손: 검출✅ 품질${(q*100).toFixed(0)}% (${(DIAG_HAND_QUALITY_MIN*100)}%미달) — 손 펴서 정면</span>\n`;
+        else          handLine=`<span class="dim">손: ✅ 품질${(q*100).toFixed(0)}% 거리${wd}</span>\n`;
+      }
+      // v9.7: 팔 자세 실시간 편차 (1번 기준 대비). 흔들리면 즉시 빨강.
+      let armLine="";
+      if(diagArmBaseline && diagPose.id!=="wrist_reference_start" && lastRawAngles){
+        const dy=Math.abs(V.wrap180((lastRawAngles[0]??0)-diagArmBaseline[0]));
+        const ds=Math.abs((lastRawAngles[1]??0)-diagArmBaseline[1]);
+        const de=Math.abs((lastRawAngles[2]??0)-diagArmBaseline[2]);
+        const ok=dy<=DIAG_ARM_YAW_TOL&&ds<=DIAG_ARM_SHOULDER_TOL&&de<=DIAG_ARM_ELBOW_TOL;
+        const mk=(v,t)=>v<=t?`${v.toFixed(0)}°`:`${v.toFixed(0)}°✗`;
+        armLine=`<span class="${ok?'dim':'c-diag'}">팔 편차 CH0:${mk(dy,DIAG_ARM_YAW_TOL)} CH1:${mk(ds,DIAG_ARM_SHOULDER_TOL)} CH2:${mk(de,DIAG_ARM_ELBOW_TOL)} ${ok?'':'← 팔 고정!'}</span>\n`;
+      } else if(diagPose.id==="wrist_reference_start"){
+        armLine=`<span class="${diagReferenceLocked?'dim':'c-diag'}">${diagReferenceLocked?'기준 잠김 ✅':'이 자세가 1~7번 팔 기준 — 정확히'}</span>\n`;
+      }
+      diagBanner=
+        `<span class="c-diag">🔬 진단 [${diagIdx+1}/${DIAG_POSES.length}] ${diagPose.name}${diagCapturing?' 📸캡처중':' [스페이스]캡처 [B]재촬영 [S]건너뛰기'}</span>\n`+
+        `<span class="c-diag">▸ ${diagPose.setup}</span>\n`+
+        `<span class="dim">${diagPose.desc}</span>\n`+
+        handLine+armLine+
+        `<span class="dim">─────────────────────────</span>\n`;
+    }
+    const romBanner = romActive ? romHudBanner(ts) : "";
+    $hud.innerHTML = diagBanner+romBanner+
+      `<span class="c-upper">상완  (${fmt(u.x)}, ${fmt(u.y)}, ${fmt(u.z)})  ${V.len(u).toFixed(3)}m</span>\n`+
+      `<span class="c-fore">전완  (${fmt(f.x)}, ${fmt(f.y)}, ${fmt(f.z)})  ${V.len(f).toFixed(3)}m</span>\n`+
+      `<span class="dim">─────────────────────────</span>\n`+
+      `팔꿈치 굽힘   ${arm.elbowFlexion.toFixed(1)}°\n`+
+      `<span class="c-yaw">어깨 좌우     ${lastRawAngles[0]!=null?lastRawAngles[0].toFixed(1):'--'}°</span>\n`+
+      `어깨 상하     ${arm.shoulderUpDown.toFixed(1)}°\n`+
+      (hand
+        ? `<span class="c-palm">CH3 상대상하 ${wristUpDownAngle!=null?wristUpDownAngle.toFixed(1):'--'}°  CH4 상대축회전 ${wristTwistAngle!=null?wristTwistAngle.toFixed(1):'--'}° ${wristKin.referenceReady?'📍':'기준없음'}</span>\n`+
+          `<span class="${wristFrameVerdict(wristKin.frameQuality).cls}">${wristFrameVerdict(wristKin.frameQuality).label}</span>\n`+
+          `<span class="dim">측면굽힘 진단 ${wristSideBendAngle!=null?wristSideBendAngle.toFixed(1):'--'}° · 손가락 개폐 미사용 · 손 품질 ${((hand.quality??0)*100).toFixed(0)}%</span>\n`
+        : `<span class="c-palm dim">CH3/CH4 손목 자세 (손바닥 기준점 미감지)</span>\n`)+
+      `<span class="dim">──── 5축 서보 목표 ${robotConnected?'[전송중]':(hardwareConfigValid()?'[미연결]':'[보정 잠금]')} ────</span>\n`+
+      `<span class="c-srv">CH0 베이스 ${fmtServo(servos[0])}  CH1 숄더 ${fmtServo(servos[1])}</span>\n`+
+      `<span class="c-srv">CH2 엘보우 ${fmtServo(servos[2])}  CH3 손목상하 ${fmtServo(servos[3])}</span>\n`+
+      `<span class="c-srv">CH4 손목축회전 ${fmtServo(servos[4])}</span>\n`+
+      `<span class="dim">─────────────────────────</span>\n`+
+      // 시스템 상태 표시
+      (sysState==='idle'
+        ? `<span class="dim">⏸ 대기 — 트리거(엔터/박수2)로 시동</span>\n`
+        : sysState==='arming'
+        ? `<span class="c-arm">🎯 시동 준비 — 기준자세 취하세요</span>\n`+
+          `<span class="c-arm">   일치도 ${(poseMatch*100).toFixed(0)}% ${matchGauge(poseMatch)}</span>\n`
+        : `<span class="c-active">▶ 추적 중 — 로봇 동기화됨</span>\n`)+
+      (personLocked
+        ? `<span class="c-lock">🔓 인물고정</span>`
+        : `<span class="dim">인물 미고정</span>`)+
+      `<span class="dim">  ·  ${refPose?'📍자세등록됨':'자세 미등록'}</span>`+
+      `<span class="dim">  ·  ${clapActive?'🎤박수ON':'🎤OFF'}</span>\n`+
+      `<span class="c-fps">화면 ${fpsVal.toFixed(0)} fps</span>\n`+
+      `<span class="c-perf">pose ${poseMs.toFixed(0)}ms(${poseDelegate}) · hand ${handMs.toFixed(0)}ms(${handDelegate})</span>`;
+
+    draw3DView(arm, hand);
+  } else {
+    $hud.innerHTML=`<span class="dim">사람이 안 보여 — 어깨~손목이 프레임에 다 들어오게</span>\n`+
+                   `<span class="c-fps">화면 ${fpsVal.toFixed(0)} fps</span>`;
+    ctx3d.clearRect(0,0,240,240);
+  }
+}
+
+function fmt(n){ return (n>=0?"+":"")+n.toFixed(3); }
+// 자세 일치도 막대 게이지 (텍스트)
+function matchGauge(m){
+  const n=Math.round(m*10);
+  return "["+"█".repeat(n)+"░".repeat(10-n)+"]";
+}
+
+function drawArrow(ctx,p1,p2,color,w){
+  ctx.strokeStyle=color; ctx.fillStyle=color; ctx.lineWidth=w; ctx.lineCap="round";
+  ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.stroke();
+  const a=Math.atan2(p2.y-p1.y,p2.x-p1.x); const L=w*2.2;
+  ctx.beginPath(); ctx.moveTo(p2.x,p2.y);
+  ctx.lineTo(p2.x-L*Math.cos(a-0.4),p2.y-L*Math.sin(a-0.4));
+  ctx.lineTo(p2.x-L*Math.cos(a+0.4),p2.y-L*Math.sin(a+0.4));
+  ctx.closePath(); ctx.fill();
+}
+function drawJoint(ctx,p,dpr){
+  ctx.fillStyle="#fff"; ctx.strokeStyle="#000"; ctx.lineWidth=2*dpr;
+  ctx.beginPath(); ctx.arc(p.x,p.y,7*dpr,0,Math.PI*2); ctx.fill(); ctx.stroke();
+}
+
+// ════════════════════════════════════════════════════════
+// 3D 미니뷰 (자동 회전 + 손바닥 기준 프레임만 표시)
+// ════════════════════════════════════════════════════════
+let viewAngle=0;
+function draw3DView(arm, hand){
+  const c=ctx3d; c.clearRect(0,0,240,240);
+  const cx=120, cy=120, scale=200;
+  viewAngle+=0.01;
+  const ca=Math.cos(viewAngle), sa=Math.sin(viewAngle);
+
+  const project=(p)=>{
+    const x=p.x-arm.sh.x, y=p.y-arm.sh.y, z=p.z-arm.sh.z;
+    const x2=x*ca+z*sa, z2=-x*sa+z*ca;
+    const depth=1+z2*0.45;
+    return {x:cx+x2*scale/depth, y:cy+y*scale/depth, depth};
+  };
+
+  // 바닥 그리드
+  c.strokeStyle="rgba(120,140,180,0.1)"; c.lineWidth=1;
+  for(let gx=-2;gx<=2;gx++){
+    const a=project({x:gx*0.15,y:0.0,z:-0.3}), b=project({x:gx*0.15,y:0.0,z:0.3});
+    c.beginPath(); c.moveTo(a.x,a.y); c.lineTo(b.x,b.y); c.stroke();
+  }
+  // 축
+  c.strokeStyle="rgba(140,160,200,0.2)"; c.lineWidth=1;
+  c.beginPath(); c.moveTo(12,cy); c.lineTo(228,cy); c.moveTo(cx,12); c.lineTo(cx,228); c.stroke();
+
+  const ps=project(arm.sh), po=project(arm.osh), pe=project(arm.el), pw=project(arm.wr);
+
+  // 어깨선
+  c.strokeStyle="#ff7eaa"; c.lineWidth=2.5;
+  c.beginPath(); c.moveTo(ps.x,ps.y); c.lineTo(po.x,po.y); c.stroke();
+  // 상완
+  c.strokeStyle="#ff9e57"; c.lineWidth=4.5;
+  c.beginPath(); c.moveTo(ps.x,ps.y); c.lineTo(pe.x,pe.y); c.stroke();
+  // 전완
+  c.strokeStyle="#7be0a8"; c.lineWidth=4.5;
+  c.beginPath(); c.moveTo(pe.x,pe.y); c.lineTo(pw.x,pw.y); c.stroke();
+
+  // 손바닥 기준 프레임 (worldLm을 손목 기준으로 평행이동)
+  if(hand && hand.worldLm){
+    const hWr=hand.worldLm[HAND_IDX.Wr];
+    const handPts=hand.worldLm.map(p=>project({
+      x:arm.wr.x+(p.x-hWr.x), y:arm.wr.y+(p.y-hWr.y), z:arm.wr.z+(p.z-hWr.z)
+    }));
+    c.strokeStyle="#a8b8ff"; c.lineWidth=1.8;
+    for(const [a,b] of HAND_FRAME_BONES){
+      c.beginPath(); c.moveTo(handPts[a].x,handPts[a].y); c.lineTo(handPts[b].x,handPts[b].y); c.stroke();
+    }
+    // 손바닥 normal (노란 점선)
+    const NL=0.08;
+    const ne=project({x:arm.wr.x+hand.normal.x*NL, y:arm.wr.y+hand.normal.y*NL, z:arm.wr.z+hand.normal.z*NL});
+    c.strokeStyle="#ffd479"; c.lineWidth=2; c.setLineDash([4,3]);
+    c.beginPath(); c.moveTo(pw.x,pw.y); c.lineTo(ne.x,ne.y); c.stroke(); c.setLineDash([]);
+  }
+
+  // 관절 점
+  for(const p of [ps,pe,pw,po]){
+    c.fillStyle="#fff"; c.beginPath(); c.arc(p.x,p.y,4,0,Math.PI*2); c.fill();
+  }
+
+  c.fillStyle="rgba(207,224,240,0.55)"; c.font="10px ui-monospace,monospace";
+  c.fillText("3D · auto-rotate", 8, 230);
+}
+
+// ════════════════════════════════════════════════════════
+// 로봇 제어 — 물리 구조와 동일한 5축 전용 프로토콜
+// CH0 베이스 / CH1 숄더 / CH2 엘보우 / CH3 손목 상하 / CH4 손목 축회전
+// 손가락 개폐·집기 상태·추가 출력축은 코드에 존재하지 않는다.
+// ════════════════════════════════════════════════════════
+const AXIS_COUNT=5;
+let serialPort=null,serialWriter=null,robotConnected=false;
+let lastRobotSend=0;
+const ROBOT_INTERVAL=50;
+
+// ┌──────────────────── 하드웨어 보정 구역 ────────────────────┐
+// 현재 CH0/CH1 서보 교환, CH2 서보 교체 후 중앙·방향·안전범위가 미측정 상태다.
+// 그래서 예전 값을 재사용하지 않고 NaN으로 비워 두며, 아래 플래그가 false인 동안
+// 로봇 연결과 PWM 활성화를 코드가 거부한다.
+const HARDWARE_CALIBRATION_READY=false;
+const CH4_TWIST_ROM_READY=false;
+
+const SERVO_RANGE=[280,280,180,180,180];
+const ROBOT_STOW_POSE=[NaN,NaN,NaN,NaN,NaN];
+const ROBOT_TELEOP_NEUTRAL=[NaN,NaN,NaN,NaN,NaN];
+const JOINT_MIN=[NaN,NaN,NaN,NaN,NaN];
+const JOINT_MAX=[NaN,NaN,NaN,NaN,NaN];
+const ROBOT_TELEOP_MIN=[NaN,NaN,NaN,NaN,NaN];
+const ROBOT_TELEOP_MAX=[NaN,NaN,NaN,NaN,NaN];
+
+// 사람 각도 증가와 실제 서보 명령 증가 방향. 실측 후 ±1을 확정한다.
+const MAP_CFG=[
+  {dir:+1,gain:1.0}, // CH0 베이스
+  {dir:+1,gain:1.0}, // CH1 숄더
+  {dir:+1,gain:1.0}, // CH2 엘보우
+  {dir:+1,gain:1.0}, // CH3 손목 상하
+  {dir:+1,gain:1.0}  // CH4 손목 축회전
+];
+
+// CH0~CH3은 기존 사람 측정값을 보존한다. CH4의 예전 값은 측면 굽힘 진단 굽힘값이므로 폐기한다.
+// 새 CH4 축회전 ROM을 측정하기 전에는 {0,0}으로 두어 로봇 명령을 만들지 않는다.
+let HUMAN_ROM_PROFILE=[
+  {min:-66.8,max:8.3},
+  {min:0,max:43.0},
+  {min:-45.0,max:61.6},
+  {min:-8.7,max:25.9},
+  {min:0,max:0}
+];
+const HUMAN_ROM_STORAGE_KEY='armvec_human_rom_v90_twist5';
+try{
+  const savedRom=JSON.parse(localStorage.getItem(HUMAN_ROM_STORAGE_KEY)||'null');
+  if(Array.isArray(savedRom)&&savedRom.length===AXIS_COUNT) HUMAN_ROM_PROFILE=savedRom;
+}catch(e){}
+
+function finiteArray(a){return Array.isArray(a)&&a.length===AXIS_COUNT&&a.every(Number.isFinite);}
+function hardwareConfigValid(){
+  if(!HARDWARE_CALIBRATION_READY||!CH4_TWIST_ROM_READY) return false;
+  const arrays=[ROBOT_STOW_POSE,ROBOT_TELEOP_NEUTRAL,JOINT_MIN,JOINT_MAX,ROBOT_TELEOP_MIN,ROBOT_TELEOP_MAX];
+  if(!arrays.every(finiteArray)) return false;
+  for(let i=0;i<AXIS_COUNT;i++){
+    if(JOINT_MIN[i]>=JOINT_MAX[i]||ROBOT_TELEOP_MIN[i]>ROBOT_TELEOP_NEUTRAL[i]||ROBOT_TELEOP_NEUTRAL[i]>ROBOT_TELEOP_MAX[i]) return false;
+    if(Math.abs(HUMAN_ROM_PROFILE[i]?.min??0)<1&&Math.abs(HUMAN_ROM_PROFILE[i]?.max??0)<1) return false;
+  }
+  return true;
+}
+function fmtServo(v){return Number.isFinite(v)?`${v.toFixed(0)}°`:'--';}
+// └──────────────────────────────────────────────────────────┘
+
+const RETARGET_CFG={enabled:true,deadzoneDeg:1.2,minUsableSideSpanDeg:7.0,maxGain:3.0};
+let calibRef=null;
+let sysState='idle';
+const REFPOSE_STORAGE_KEY='armvec_refpose_v96_relquat';
+let refPose=null;
+try{
+  const saved=JSON.parse(localStorage.getItem(REFPOSE_STORAGE_KEY)||'null');
+  if(Array.isArray(saved)&&saved.length===AXIS_COUNT) refPose=saved;
+}catch(e){}
+if(refPose&&!wristReferenceQuat) refPose=null; // v9.5는 손목 쿼터니언 기준이 함께 있어야 유효
+let poseMatch=0,matchHoldStart=0;
+const POSE_MATCH_TOLERANCE=35,POSE_MATCH_THRESHOLD=.80,POSE_MATCH_HOLD=400;
+const rawDefaultRef=[0,90,0,0,0];
+let lastRawAngles=Array(AXIS_COUNT).fill(null);
+function clamp(v,lo,hi){return v<lo?lo:(v>hi?hi:v);}
+let lastServoOut=Array(AXIS_COUNT).fill(NaN);
+
+function computePoseMatch(raw){
+  if(!refPose) return 0;
+  let total=0,count=0;const weights=[1,1,1,.5,.5];
+  for(let i=0;i<AXIS_COUNT;i++){
+    if(!weights[i]||raw[i]==null||refPose[i]==null)continue;
+    const d=i===0?Math.abs(V.wrap180(raw[i]-refPose[i])):Math.abs(raw[i]-refPose[i]);
+    total+=Math.max(0,1-d/POSE_MATCH_TOLERANCE)*weights[i];count+=weights[i];
+  }
+  return count?total/count:0;
+}
+
+let shoulderLRCont=null,shoulderLRPrevRaw=null;
+// ★2026-07-15 수정★
+//   옛 코드는 팔이 수직에 가까워 방위각이 무의미해질 때 그냥 return 했다.
+//   그동안 shoulderLRPrevRaw가 낡은 채로 남고, 팔이 다시 내려오면
+//   wrap180(현재 - 낡은값)이 엉뚱한 가지를 골라 ±360°를 통째로 주입했다.
+//   실측: twist_palm_in = -559.3° = 160.7 - 2×360 (360의 배수만큼 누적)
+//   수정: 얼어붙는 동안 prevRaw를 null로 비워 재시드하게 만든다.
+//         (얼어붙은 사이의 실제 회전은 원리적으로 측정 불가하므로 0으로 두는 게 맞다)
+const SHOULDER_LR_WINDUP_LIMIT=180;   // C-7: 누적값 하드 클램프
+function shoulderLRTrackerUpdate(arm){
+  if(!arm||!Number.isFinite(arm.shoulderLRRaw))return shoulderLRCont!=null?shoulderLRCont:0;
+  if((arm.shoulderLRHorizontal??0)<.10){
+    shoulderLRPrevRaw=null;                       // ★재시드 — 점프 주입 차단
+    return shoulderLRCont!=null?shoulderLRCont:0;
+  }
+  const raw=arm.shoulderLRRaw;
+  if(shoulderLRPrevRaw===null){
+    if(shoulderLRCont===null) shoulderLRCont=raw; // 첫 시드
+    shoulderLRPrevRaw=raw;                        // 재시드 시엔 delta 0
+    return shoulderLRCont;
+  }
+  shoulderLRCont+=V.wrap180(raw-shoulderLRPrevRaw);
+  shoulderLRCont=clamp(shoulderLRCont,-SHOULDER_LR_WINDUP_LIMIT,SHOULDER_LR_WINDUP_LIMIT);
+  shoulderLRPrevRaw=raw;
+  return shoulderLRCont;
+}
+function shoulderLRTrackerReset(){shoulderLRCont=null;shoulderLRPrevRaw=null;}
+function extractRawAngles(arm,wristUpDownAngle,wristTwistAngle){
+  const raw=Array(AXIS_COUNT).fill(null);
+  raw[0]=shoulderLRTrackerUpdate(arm);
+  raw[1]=arm.shoulderUpDown;
+  raw[2]=arm.elbowFlexion;
+  if(Number.isFinite(wristUpDownAngle))raw[3]=wristUpDownAngle;
+  if(Number.isFinite(wristTwistAngle))raw[4]=wristTwistAngle;
+  return raw;
+}
+function mappedHumanDelta(raw,i){
+  const ref=calibRef?calibRef[i]:(refPose?refPose[i]:rawDefaultRef[i]);
+  const d=i===0?V.wrap180(raw-ref):(raw-ref);
+  return d*MAP_CFG[i].dir*MAP_CFG[i].gain;
+}
+function retargetDeltaToServo(delta,i){
+  const neutral=ROBOT_TELEOP_NEUTRAL[i],p=HUMAN_ROM_PROFILE[i]||{min:0,max:0};
+  if(!Number.isFinite(neutral))return NaN;
+  if(Math.abs(delta)<RETARGET_CFG.deadzoneDeg)return neutral;
+  if(!RETARGET_CFG.enabled)return neutral+delta;
+  const neg=delta<0;
+  const humanSpan=Math.abs(neg?p.min:p.max);
+  if(humanSpan<RETARGET_CFG.minUsableSideSpanDeg)return neutral;
+  const robotSpan=(neg?ROBOT_TELEOP_MIN[i]:ROBOT_TELEOP_MAX[i])-neutral;
+  const ratio=clamp(Math.abs(delta)/humanSpan,0,1);
+  const gain=Math.abs(robotSpan)/humanSpan;
+  const scale=gain>RETARGET_CFG.maxGain?RETARGET_CFG.maxGain/gain:1;
+  return neutral+robotSpan*scale*ratio;
+}
+
+// 이중 속도 안전장치. 중력 시뮬레이션 결과에 따라 CH1/CH2를 가장 보수적으로 둔다.
+const CMD_MAX_VEL=[45,28,42,55,55];
+const CMD_MAX_ACCEL=[160,100,150,220,220];
+const GRAVITY_GUARD={enabled:true,minScale:.35};
+let cmdSafety={pos:Array(AXIS_COUNT).fill(0),vel:Array(AXIS_COUNT).fill(0),t:null};
+function resetCommandSafety(pose){
+  if(!finiteArray(pose))return;
+  cmdSafety={pos:[...pose],vel:Array(AXIS_COUNT).fill(0),t:null};lastServoOut=[...pose];
+}
+// ══════════════════════════════════════════════════════════
+// 중력 가드 — 2026-07-15 실측으로 반전 버그 수정
+// ══════════════════════════════════════════════════════════
+// [옛 코드의 치명적 버그]
+//   q1 = |CH1 − TELEOP_NEUTRAL[1]| ; risk ∝ sin(q1)
+//   → "NEUTRAL(=177°)이 수직이고 무부하"라고 가정했다.
+//   그런데 실측 결과 CH1 177° = 상완 '수평' = 중력토크 최대다.
+//   즉 STOW(최대부하)에서 풀스피드, 수직(무부하)에서 37% 감속.
+//   부호가 정확히 뒤집혀 있었다. 35kg 서보가 죽고 PCA9685 전원부가 탄 축이 바로 여기다.
+//
+// [실측 앵커 — 이것만 쓴다]
+//   CH1 177.00° = 상완 수평   /  CH1 254.37° = 상완 수직
+//   CH2 175.00° = 전완이 상완과 일직선(완전 전개) / CH2 60.00° = 최대 굽힘
+//   축간거리: CH1→CH2 11.6cm, CH2→CH3 14.8cm, CH3→CH4 7.0cm
+//
+// [모델] 2링크 무게중심의 '수평거리'가 CH1 토크에 비례한다.
+//   최악(수평 + 완전전개) CoM 수평거리 22.8cm 를 부하 1.0으로 정규화.
+//   이 모델은 "상완이 수직이어도 전완이 접혀 옆으로 뻗으면 부하가 남는다"까지 잡는다.
+const CH1_HORIZONTAL_DEG=177.00, CH1_VERTICAL_DEG=254.37;
+const CH2_STRAIGHT_DEG=175.00,  CH2_MINCMD_DEG=60.00;
+const LINK_L1=11.6, LINK_L2=14.8, LINK_L3=7.0;      // cm
+const LINK_M=[140,140,100];                          // g, P2/P3/P4 집중질량 추정
+const GRAV_WORST_COM_CM=22.8;                        // 수평+완전전개 기준
+function upperArmElevDeg(ch1){                       // 수평=0°, 수직=+90°
+  return (ch1-CH1_HORIZONTAL_DEG)*90/(CH1_VERTICAL_DEG-CH1_HORIZONTAL_DEG);
+}
+function elbowFlexDeg(ch2){                          // 일직선=0°, 최대굽힘=115°
+  return (CH2_STRAIGHT_DEG-ch2)*115/(CH2_STRAIGHT_DEG-CH2_MINCMD_DEG);
+}
+function gravityLoad(ch1,ch2){
+  if(!Number.isFinite(ch1)||!Number.isFinite(ch2)) return 1;   // 모르면 최대 보수
+  const a=upperArmElevDeg(ch1)*Math.PI/180;
+  const f=elbowFlexDeg(ch2)*Math.PI/180;             // 전완은 상완에서 위로 접힌다
+  const P2x=LINK_L1*Math.cos(a);
+  const P3x=P2x+LINK_L2*Math.cos(a+f);
+  const P4x=P3x+LINK_L3*Math.cos(a+f);
+  const M=LINK_M[0]+LINK_M[1]+LINK_M[2];
+  const com=Math.abs((LINK_M[0]*P2x+LINK_M[1]*P3x+LINK_M[2]*P4x)/M);
+  return clamp(com/GRAV_WORST_COM_CM,0,1);
+}
+function gravityMotionScale(target){
+  if(!GRAVITY_GUARD.enabled||!hardwareConfigValid())return 1;
+  return clamp(1-0.65*gravityLoad(target[1],target[2]),GRAVITY_GUARD.minScale,1);
+}
+function applyForbiddenPoseRules(target){
+  // 실측 충돌조합은 이후 이 함수 한 곳에 추가한다.
+  return target;
+}
+function applyCommandSafety(target,ts=performance.now()){
+  if(!hardwareConfigValid()||!finiteArray(target))return Array(AXIS_COUNT).fill(NaN);
+  target=applyForbiddenPoseRules([...target]);
+  if(cmdSafety.t==null){cmdSafety.t=ts;if(!finiteArray(cmdSafety.pos))cmdSafety.pos=[...ROBOT_STOW_POSE];cmdSafety.vel=Array(AXIS_COUNT).fill(0);return [...cmdSafety.pos];}
+  const dt=clamp((ts-cmdSafety.t)/1000,.008,.10);cmdSafety.t=ts;
+  const loadScale=gravityMotionScale(target);
+  for(let i=0;i<AXIS_COUNT;i++){
+    const axisScale=(i===1||i===2)?loadScale:1;
+    const err=target[i]-cmdSafety.pos[i];
+    let desiredVel=clamp(err/dt,-CMD_MAX_VEL[i]*axisScale,CMD_MAX_VEL[i]*axisScale);
+    const dv=clamp(desiredVel-cmdSafety.vel[i],-CMD_MAX_ACCEL[i]*axisScale*dt,CMD_MAX_ACCEL[i]*axisScale*dt);
+    cmdSafety.vel[i]+=dv;
+    let step=cmdSafety.vel[i]*dt;
+    if(Math.abs(step)>Math.abs(err)){step=err;cmdSafety.vel[i]=0;}
+    cmdSafety.pos[i]=clamp(cmdSafety.pos[i]+step,JOINT_MIN[i],JOINT_MAX[i]);
+  }
+  return [...cmdSafety.pos];
+}
+function rawToServos(raw,ts=performance.now()){
+  if(!hardwareConfigValid())return Array(AXIS_COUNT).fill(NaN);
+  const target=finiteArray(lastServoOut)?[...lastServoOut]:[...ROBOT_TELEOP_NEUTRAL];
+  for(let i=0;i<AXIS_COUNT;i++){
+    if(raw[i]==null)continue;
+    const delta=mappedHumanDelta(raw[i],i);
+    target[i]=clamp(retargetDeltaToServo(delta,i),Math.max(JOINT_MIN[i],ROBOT_TELEOP_MIN[i]),Math.min(JOINT_MAX[i],ROBOT_TELEOP_MAX[i]));
+  }
+  const out=applyCommandSafety(target,ts);lastServoOut=out;return out;
+}
+function mapToServos(arm,wristUpDownAngle,wristTwistAngle){
+  const raw=extractRawAngles(arm,wristUpDownAngle,wristTwistAngle);
+  lastRawAngles=raw;return rawToServos(raw);
+}
+
+// ══════════════════════════════════════════════════════════
+// 최고 가동범위 측정 v9.0 — 실제 물리 5축과 동일
+// CH0→CH4, 각 축 3회 반복. 매 반복은 ROBOT_STOW_POSE 대응 사람 기본자세에서 시작.
+// 목표 축뿐 아니라 CH0~CH4 전부 기록해 축 혼입(coupling)을 계산한다. 로봇 출력은 OFF.
+// ══════════════════════════════════════════════════════════
+const ROM_CHANNELS=[
+  {ch:0,key:"shoulder_left_right",name:"어깨 좌우",jump:20,margin:3,instruction:"상완만 좌우로 천천히. 몸통 정면 고정."},
+  {ch:1,key:"shoulder_up_down",name:"어깨 상하",jump:18,margin:3,instruction:"상완을 아래·위 끝까지. 몸통과 팔꿈치는 가능한 고정."},
+  {ch:2,key:"elbow_flexion",name:"엘보우",jump:22,margin:3,instruction:"상완 고정, 팔꿈치만 편 상태↔최대 굽힘."},
+  {ch:3,key:"wrist_up_down",name:"손목 상하",jump:24,margin:4,instruction:"전완 고정, 손목만 위·아래. 손바닥 방향 유지."},
+  {ch:4,key:"wrist_axis_twist",name:"손목 축회전",jump:28,margin:5,instruction:"등록 시작자세(손바닥 정면)에서 손바닥이 하늘을 향하는 방향으로만 천천히 회전. 반대 방향은 실사용하지 않음."}
+];
+const ROM_REPEATS=3,ROM_MIN_AXIS_DURATION=8000,ROM_MIN_AXIS_SAMPLES=40;
+const ROM_Q_LOW=.02,ROM_Q_HIGH=.98,ROM_CONFIDENCE_MIN=.55,ROM_HAND_QUALITY_MIN=.55;
+const ROM_BASE_HOLD=800,ROM_BASE_TOL=[14,14,16,18,18],ROM_COUPLING_WARN=.35;
+let romActive=false,romSessionStartTs=0,romAxisStartTs=0,romRefPose=null,romAxes=[];
+let romStep=0,romRepeat=0,romPhase="idle",romBaseHoldStart=0,romBaseMatch=0,romResult=null;
+let romRejected=0,romLowConfidenceRejected=0;
+
+function blankRepeat(){return {samplesByChannel:Array.from({length:AXIS_COUNT},()=>[]),sideBendSamples:[],last:Array(AXIS_COUNT).fill(null),lastTs:Array(AXIS_COUNT).fill(0),pending:Array(AXIS_COUNT).fill(null),pendingTs:Array(AXIS_COUNT).fill(0),rejected:0,lowConfidenceRejected:0,durationMs:0,startedAt:null,endedAt:null};}
+function romResetAxes(){
+  romAxes=ROM_CHANNELS.map(c=>({...c,repeats:[],current:null,min:null,max:null,completed:false}));
+  romRejected=0;romLowConfidenceRejected=0;romRepeat=0;
+}
+function romCurrentAxis(){return romAxes[romStep]||null;}
+function romCurrentRep(){const a=romCurrentAxis();return a?.repeats[romRepeat]||null;}
+function romDeltaForAxis(raw,i){
+  if(raw==null||!romRefPose||romRefPose[i]==null) return null;
+  const d=i===0?V.wrap180(raw-romRefPose[i]):raw-romRefPose[i];
+  return d*MAP_CFG[i].dir*MAP_CFG[i].gain;
+}
+function romAcceptSample(rep,i,delta,ts){
+  if(!Number.isFinite(delta)) return false;
+  const cfg=ROM_CHANNELS[i];
+  if(rep.last[i]!=null){
+    const dt=Math.max(16,ts-rep.lastTs[i]),allowed=cfg.jump*Math.max(1,Math.min(3,dt/50));
+    if(Math.abs(delta-rep.last[i])>allowed){
+      if(rep.pending[i]!=null&&ts-rep.pendingTs[i]<250&&Math.abs(delta-rep.pending[i])<allowed*.55) rep.pending[i]=null;
+      else{rep.pending[i]=delta;rep.pendingTs[i]=ts;if(i===romCurrentAxis().ch){rep.rejected++;romRejected++;}return false;}
+    }else rep.pending[i]=null;
+  }
+  rep.last[i]=delta;rep.lastTs[i]=ts;rep.samplesByChannel[i].push(delta);return true;
+}
+function romBasePoseScore(raw){
+  if(!raw||!romRefPose) return 0;let sum=0;
+  for(let i=0;i<5;i++){
+    if(raw[i]==null||romRefPose[i]==null) return 0;
+    const d=i===0?Math.abs(V.wrap180(raw[i]-romRefPose[i])):Math.abs(raw[i]-romRefPose[i]);
+    sum+=Math.max(0,1-d/ROM_BASE_TOL[i]);
+  }
+  return sum/5;
+}
+function romPrepareAxis(axisIndex,repeatIndex=0){
+  romStep=axisIndex;romRepeat=repeatIndex;romPhase="await_base";romAxisStartTs=0;romBaseHoldStart=0;romBaseMatch=0;
+  const a=romCurrentAxis();if(!a)return;
+  a.current=a.min=a.max=null;
+  $btnRom.textContent=`⏳ CH${a.ch} ${repeatIndex+1}/${ROM_REPEATS} 기본자세`;
+  setStatus(`CH${a.ch} ${a.name} ${repeatIndex+1}/${ROM_REPEATS}회 준비 — 등록 기본자세로 복귀하세요`);
+}
+function romBeginCurrentAxis(ts){
+  const a=romCurrentAxis();if(!a)return;
+  a.repeats[romRepeat]=blankRepeat();const rep=romCurrentRep();rep.startedAt=ts;
+  a.current=a.min=a.max=null;romAxisStartTs=ts;romPhase="measuring";
+  $btnRom.textContent=`⏹ CH${a.ch} ${romRepeat+1}/${ROM_REPEATS} 완료`;
+  setStatus(`▶ CH${a.ch} ${a.name} ${romRepeat+1}/${ROM_REPEATS}회 — ${a.instruction}`);
+  setTimeout(()=>{if(romActive&&romPhase==="measuring")$status.style.opacity=0;},2600);
+}
+function romCollectSample(ts,arm,hand){
+  if(!romActive||!lastRawAngles)return;
+  if(romPhase==="await_base"){
+    romBaseMatch=romBasePoseScore(lastRawAngles);
+    if(romBaseMatch>=.78){if(!romBaseHoldStart)romBaseHoldStart=ts;if(ts-romBaseHoldStart>=ROM_BASE_HOLD)romBeginCurrentAxis(ts);}else romBaseHoldStart=0;
+    return;
+  }
+  if(romPhase!=="measuring")return;
+  const a=romCurrentAxis(),rep=romCurrentRep();if(!a||!rep)return;
+  const armOk=(arm?.trackConfidence??0)>=ROM_CONFIDENCE_MIN;
+  const handOk=!!hand&&(hand.quality??0)>=ROM_HAND_QUALITY_MIN;
+  const targetQuality=a.ch<=2?armOk:(armOk&&handOk);
+  if(!targetQuality){rep.lowConfidenceRejected++;romLowConfidenceRejected++;return;}
+
+  for(let i=0;i<5;i++){
+    if(i>=3&&!handOk)continue;
+    const d=romDeltaForAxis(lastRawAngles[i],i);
+    if(d!=null&&romAcceptSample(rep,i,d,ts)&&i===a.ch){a.current=d;a.min=a.min==null?d:Math.min(a.min,d);a.max=a.max==null?d:Math.max(a.max,d);}
+  }
+  if(handOk&&Number.isFinite(lastWristSideBendAngle))rep.sideBendSamples.push(lastWristSideBendAngle);
+}
+function quantile(arr,q){if(!arr.length)return null;const x=[...arr].sort((a,b)=>a-b),p=(x.length-1)*q,l=Math.floor(p),h=Math.ceil(p);return l===h?x[l]:x[l]+(x[h]-x[l])*(p-l);}
+function medianRom(arr){return quantile(arr.filter(Number.isFinite),.5);}
+function r1(v){return v==null?null:Math.round(v*10)/10;}
+function signed1(v){if(v==null)return"--";const n=Math.abs(v)<.05?0:v;return`${n>=0?"+":""}${n.toFixed(1)}°`;}
+function robustRange(arr){const lo=quantile(arr,ROM_Q_LOW),hi=quantile(arr,ROM_Q_HIGH);return {min:lo,max:hi,range:lo==null||hi==null?null:hi-lo};}
+function romFinishCurrentAxis(){
+  if(!romActive||romPhase!=="measuring")return;
+  const now=performance.now(),a=romCurrentAxis(),rep=romCurrentRep(),elapsed=now-romAxisStartTs;
+  if(elapsed<ROM_MIN_AXIS_DURATION){const remain=Math.ceil((ROM_MIN_AXIS_DURATION-elapsed)/1000);setStatus(`${remain}초 더 측정하세요`);return;}
+  rep.endedAt=now;rep.durationMs=Math.round(elapsed);
+  if(romRepeat<ROM_REPEATS-1)romPrepareAxis(romStep,romRepeat+1);
+  else{a.completed=true;if(romStep<ROM_CHANNELS.length-1)romPrepareAxis(romStep+1,0);else romComplete(now);}
+}
+function romBuildResult(endTs){
+  const channels=[];
+  for(const a of romAxes){
+    const repeatStats=a.repeats.map((rep,idx)=>{
+      const by=rep.samplesByChannel.map(robustRange),tw=robustRange(rep.sideBendSamples);
+      return {repeat:idx+1,durationMs:rep.durationMs,targetSampleCount:rep.samplesByChannel[a.ch].length,rejectedJumpCount:rep.rejected,rejectedLowConfidenceCount:rep.lowConfidenceRejected,channels:by.map((x,i)=>({channel:`CH${i}`,sampleCount:rep.samplesByChannel[i].length,robustMin:r1(x.min),robustMax:r1(x.max),robustRange:r1(x.range)})),sideBendDiagnostic:{sampleCount:rep.sideBendSamples.length,robustMin:r1(tw.min),robustMax:r1(tw.max),robustRange:r1(tw.range)}};
+    });
+    const targetMins=repeatStats.map(x=>x.channels[a.ch].robustMin),targetMaxs=repeatStats.map(x=>x.channels[a.ch].robustMax);
+    const qMin=medianRom(targetMins),qMax=medianRom(targetMaxs);
+    const safeMin=qMin==null?0:Math.min(0,qMin+a.margin),safeMax=qMax==null?0:Math.max(0,qMax-a.margin);
+    const couplingRanges=[];
+    for(let j=0;j<5;j++)couplingRanges[j]=medianRom(repeatStats.map(x=>x.channels[j].robustRange));
+    const targetRange=Math.max(1e-6,couplingRanges[a.ch]||0);
+    const coupling=couplingRanges.map((r,j)=>({channel:`CH${j}`,robustRangeDeg:r1(r),ratioToTarget:r==null?null:r1(r/targetRange),warning:j!==a.ch&&r/targetRange>ROM_COUPLING_WARN}));
+    const repeatDevValues=[...targetMins.filter(Number.isFinite).map(v=>Math.abs(v-qMin)),...targetMaxs.filter(Number.isFinite).map(v=>Math.abs(v-qMax))];
+    const repeatDeviation=repeatDevValues.length?Math.max(...repeatDevValues):null;
+    const sideBendRange=medianRom(repeatStats.map(x=>x.sideBendDiagnostic.robustRange));
+    const enough=a.repeats.length===ROM_REPEATS&&a.repeats.every(r=>r.durationMs>=ROM_MIN_AXIS_DURATION&&r.samplesByChannel[a.ch].length>=ROM_MIN_AXIS_SAMPLES);
+    channels.push({channel:`CH${a.ch}`,axis:a.key,name:a.name,repeats:repeatStats,sufficientSamples:enough,robustHumanDeltaDeg:{min:r1(qMin),max:r1(qMax)},recommendedHumanDeltaDeg:{min:r1(safeMin),max:r1(safeMax)},repeatMaxDeviationDeg:r1(repeatDeviation),crossAxisCoupling:coupling,sideBendContamination:{medianRobustRangeDeg:r1(sideBendRange),warning:(a.ch===3||a.ch===4)&&(sideBendRange??0)>30},configuredRobotRetarget:{neutralDeg:ROBOT_TELEOP_NEUTRAL[a.ch],minDeg:ROBOT_TELEOP_MIN[a.ch],maxDeg:ROBOT_TELEOP_MAX[a.ch]},inwardSafetyMarginDeg:a.margin});
+  }
+  const profile=channels.map(c=>({min:c.recommendedHumanDeltaDeg.min??0,max:c.recommendedHumanDeltaDeg.max??0}));
+  const warnings=[];
+  channels.forEach(c=>{if(!c.sufficientSamples)warnings.push(`${c.channel} 샘플 부족`);if(c.crossAxisCoupling.some(x=>x.warning))warnings.push(`${c.channel} 축 혼입 큼`);if(c.sideBendContamination.warning)warnings.push(`${c.channel} 측면 굽힘 혼입`);});
+  const totalDurationMs=endTs-romSessionStartTs;
+  const summary=["Arm Vector v9.0 물리 5축 ROM·혼입 결과",`측정: CH0 베이스→CH4 손목 축회전, 축당 ${ROM_REPEATS}회`,`전체 ${(totalDurationMs/1000).toFixed(1)}초 · 점프 제외 ${romRejected} · 저품질 제외 ${romLowConfidenceRejected}`,...channels.map(c=>`${c.channel} ${c.name}: 사람 Δ ${signed1(c.recommendedHumanDeltaDeg.min)} ~ ${signed1(c.recommendedHumanDeltaDeg.max)} · 반복편차 ${c.repeatMaxDeviationDeg}° · ${c.sideBendContamination.warning?"측면굽힘 경고":"측면굽힘 정상"}`),warnings.length?`경고: ${warnings.join(", ")}`:"경고 없음"].join("\n");
+  return {version:"v9.0.0-physical-five-axis-twist",timestamp:new Date().toISOString(),measurementMode:"three_repeats_each_axis_all_channels_recorded",robotOutputDuringMeasurement:"OFF",arm:currentArm,totalDurationMs:Math.round(totalDurationMs),hardwareCalibrationReady:hardwareConfigValid(),basePoseServoDeg:ROBOT_STOW_POSE.map(v=>Number.isFinite(v)?v:null),teleopNeutralServoDeg:ROBOT_TELEOP_NEUTRAL.map(v=>Number.isFinite(v)?v:null),humanReferenceRawDeg:romRefPose.slice(0,AXIS_COUNT).map(r1),quality:{poseConfidenceMin:ROM_CONFIDENCE_MIN,handGeometryQualityMin:ROM_HAND_QUALITY_MIN,handednessScoreUsedAsQuality:false},channels,suggestedHumanRomProfile:profile,warnings,chatSummary:summary};
+}
+function romComplete(now){romResult=romBuildResult(now);romActive=false;romPhase="idle";$btnRom.textContent="📁 반복 ROM 저장";$btnRom.classList.add("on");setStatus(romResult.warnings.length?`⚠ 완료 — ${romResult.warnings.length}개 경고. 저장 후 검토 필요`:"✅ 반복 ROM 완료 — 저장하세요");}
+function romCancel(){romActive=false;romPhase="idle";romResult=null;$btnRom.textContent="📐 최고 가동범위";$btnRom.classList.remove("on");setStatus("가동범위 측정 중단");}
+async function romStart(){
+  if(!running){setStatus("먼저 카메라를 시작하세요");return;}if(!refPose){setStatus("먼저 자세 등록을 하세요");return;}if(diagActive){setStatus("진단 모드를 먼저 종료하세요");return;}
+  sysState="idle";matchHoldStart=0;if(robotConnected)await disconnectRobot();romRefPose=[...refPose];romResetAxes();romResult=null;romSessionStartTs=performance.now();romActive=true;$btnRom.classList.add("on");romPrepareAxis(0,0);
+}
+async function romExport(){
+  if(!romResult)return;const blob=new Blob([JSON.stringify(romResult,null,2)],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=`armvec_rom_v90_twist5_${Date.now()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);try{await navigator.clipboard.writeText(romResult.chatSummary);}catch(e){}setStatus("📁 저장됨 — 검토 후 suggestedHumanRomProfile을 적용하세요");$btnRom.textContent="📐 최고 가동범위";$btnRom.classList.remove("on");romResult=null;
+}
+function romHudBanner(ts){
+  const a=romCurrentAxis();if(!a)return"";const total=ROM_CHANNELS.length*ROM_REPEATS,idx=romStep*ROM_REPEATS+romRepeat+1;
+  if(romPhase==="await_base")return `<span class="c-rom2">📐 반복 ROM [${idx}/${total}] CH${a.ch} ${a.name} ${romRepeat+1}/${ROM_REPEATS}</span>\n`+`<span class="c-rom">기본자세 일치 ${(romBaseMatch*100).toFixed(0)}% ${matchGauge(romBaseMatch)}</span>\n`+`<span class="dim">각 반복은 기본자세에서 시작 · 로봇 출력 OFF</span>\n<span class="dim">─────────────────────────</span>\n`;
+  const rep=romCurrentRep(),elapsed=ts-romAxisStartTs,ready=elapsed>=ROM_MIN_AXIS_DURATION,abs=(a.current==null||!Number.isFinite(ROBOT_TELEOP_NEUTRAL[a.ch]))?null:ROBOT_TELEOP_NEUTRAL[a.ch]+a.current;
+  return `<span class="c-rom2">📐 반복 ROM [${idx}/${total}] CH${a.ch} ${a.name} ${(elapsed/1000).toFixed(1)}초 ${ready?"[완료 가능]":"[최소 8초]"}</span>\n`+`<span class="c-rom">현재 ${signed1(a.current)} (${abs==null?"--":abs.toFixed(1)+"°"}) · ${signed1(a.min)} ~ ${signed1(a.max)}</span>\n`+`<span class="dim">${a.instruction}</span>\n`+`<span class="dim">목표 ${rep?.samplesByChannel[a.ch].length||0}샘플 · 전 채널 동시 기록 · 측면굽힘 진단 ${rep?.sideBendSamples.length||0}샘플</span>\n<span class="dim">─────────────────────────</span>\n`;
+}
+
+// ══════════════════════════════════════════════════════════
+// 진단 시스템 v9.5 — 등록자세 상대쿼터니언 손목 7자세 — 미리 정의된 자세를 취하고 raw 각도의 부호·오차·혼입을 기록
+// ══════════════════════════════════════════════════════════
+// v9.0 → v9.1 변경점
+//
+//   ① 손목 자세에 '팔 자세'가 아예 없었다 (제일 큰 구멍)
+//      전완축 방향이 자세마다 달라지면 twist(raw4) 기준이 통째로 흔들려 측정이 무의미하다.
+//      → 손목 7자세 전부 WRIST_SETUP으로 팔을 고정한다.
+//
+//   ② 손목 좌우 꺾기(sideBend) 자세가 없었다
+//      로봇에 좌우 축이 없다는 이유로 빠졌는데, 정확히 그래서 필요하다.
+//      사람이 손목을 좌우로 꺾을 때 그게 CH3/CH4로 새는지(swing/twist 혼입)를
+//      확인할 수 있는 유일한 자세이고, 기존 11자세로는 영원히 못 잡는다.
+//      → wrist_side_thumb / wrist_side_pinky 신설.
+//
+//   ③ 8/9번의 expect ±45°는 쓰레기값이었다
+//      사람은 손목을 정확히 45°로 못 굽힌다. 기대값 대조를 하면 오차가
+//      "코드 버그"인지 "사람이 각도를 안 맞춘 것"인지 구분이 안 된다.
+//      → expect 삭제. 부호와 상대 크기만 판정한다 (그게 MAP_CFG.dir에 필요한 전부다).
+//
+//   ④ 4번 "위팔은 수평"의 앞/옆 모호성
+//      앞으로 수평이든 옆으로 수평이든 raw1=90°이 나오지만 raw0은 완전히 달라진다.
+//      → 옆으로 벌린 수평으로 고정.
+//
+//   ⑤ twist_in / twist_out → twist_palm_down / twist_palm_up 개명
+//      "안쪽/바깥쪽"은 CH4 정책(손바닥 정면=시작, 하늘=+, 바닥=폐기)과 용어가 안 맞았다.
+//
+// 필드
+//   setup   : 이 자세에서 반드시 유지할 팔 자세. HUD에 크게 표시된다.
+//   desc    : 이 자세가 무엇을 결정하는지.
+//   expect  : 기하학적으로 확정된 기대값만 남긴다. 없으면 부호·혼입만 본다.
+//   focus   : 어느 축을 검사하는지. "손"이 포함되면 손 검출률을 검사한다.
+
+// v9.6 손목 전용 7자세 진단.
+// 반드시 먼저 실제 운용 시작자세를 📍 등록한다.
+// CH3/CH4는 등록 쿼터니언 대비 상대각이므로 시작자세에서 둘 다 0° 부근이어야 한다.
+const ARM_SETUP="★어깨~팔꿈치 상완은 몸통 옆에 붙여 아래로★ · 팔꿈치 약 70~100° · 전완은 몸 앞으로 수평~45° · 1~7번 내내 어깨/팔꿈치 위치 고정";
+const START_PALM=ARM_SETUP+" · 손은 전완과 일직선 · 손바닥은 등록 때와 같은 정면 방향";
+
+const DIAG_POSES=[
+  { id:"wrist_reference_start", name:"등록 시작자세  [첫 기준]",
+    setup:START_PALM,
+    desc:"상대쿼터니언 영점 확인. CH3·CH4·측면굽힘이 모두 0° 근처여야 함",
+    expect:{wristUD:0,wristTwist:0}, focus:["손목상하","손목축회전","손"] },
+
+  { id:"wrist_flex", name:"CH3 굴곡 — 손끝 아래",
+    setup:START_PALM+" · 전완과 손바닥 방향은 유지 · 손목만 굴곡",
+    desc:"CH3 한쪽 부호와 ROM. CH4·측면굽힘 혼입은 작아야 함",
+    expect:{}, focus:["손목상하","혼입","손"] },
+
+  { id:"wrist_ext", name:"CH3 신전 — 손끝 위",
+    setup:START_PALM+" · 전완과 손바닥 방향은 유지 · 손목만 신전",
+    desc:"CH3 반대쪽 부호와 ROM. 굴곡/신전 두 값으로 CH3 방향 결정",
+    expect:{}, focus:["손목상하","혼입","손"] },
+
+  { id:"wrist_dev_thumb", name:"요측편위 — 엄지 쪽  [혼입]",
+    setup:START_PALM+" · 손목을 엄지 방향으로만 · 굴곡/신전 X · 비틀기 X",
+    desc:"로봇에 없는 swing Y 검사. CH3·CH4는 0° 근처에 남아야 함",
+    expect:{}, focus:["측면굽힘","혼입","손"] },
+
+  { id:"wrist_dev_pinky", name:"척측편위 — 새끼 쪽  [혼입]",
+    setup:START_PALM+" · 손목을 새끼 방향으로만 · 굴곡/신전 X · 비틀기 X",
+    desc:"로봇에 없는 swing Y 검사. CH3·CH4 혼입 확인",
+    expect:{}, focus:["측면굽힘","혼입","손"] },
+
+  { id:"twist_palm_up", name:"CH4 양의 끝 — 손바닥 하늘",
+    setup:ARM_SETUP+" · 손목은 곧게 · 등록 손바닥 정면에서 하늘 방향으로만 축회전",
+    desc:"실사용 CH4 0→약90° 구간. 로봇 18.32→103.32°에 대응",
+    expect:{}, focus:["손목축회전","혼입","손"] },
+
+  { id:"wrist_reference_end", name:"등록 시작자세  [드리프트 재확인]",
+    setup:START_PALM,
+    desc:"첫 자세와 같은 자세. CH3·CH4 차이가 각 5° 미만이면 통과",
+    expect:{wristUD:0,wristTwist:0}, focus:["손목상하","손목축회전","손"] },
+];
+
+let diagActive=false;
+let diagIdx=0;
+let diagCapturing=false;
+let diagSamples=[];       // 현재 자세의 샘플들
+let diagResults=[];       // 전체 결과
+let diagCountdown=0;
+let diagPendingAdvance=null;   // 경고 표시 후 자동 진행 타이머. B/S가 이걸 취소할 수 있어야 한다.
+let diagFramesSeen=0,diagRejectedHandQuality=0,diagRejectedFrameQuality=0,diagRejectedArmPose=0;
+// v9.7: 손 지표 3분리 카운터
+let diagHandRawPresent=0;   // 손이 화면에 하나라도 잡힌 프레임 (게이트 이전)
+let diagHandGatePassed=0;   // 게이트+품질 통과해 extractHand가 손 반환한 프레임
+let diagArmBaseline=null;
+let diagReferenceLocked=false;   // v9.7: 1번 기준자세가 성공 저장됐는지. 실패 시 다음 진행 차단
+const DIAG_ARM_YAW_TOL=18;
+const DIAG_ARM_SHOULDER_TOL=12;
+const DIAG_ARM_ELBOW_TOL=12;
+const DIAG_ARM_MIN_RATIO=0.70;
+const DIAG_REF_MIN_SAMPLES=30;   // v9.7: 1번 기준자세 최소 유효 샘플
+const DIAG_REF_MIN_RATIO=0.70;   // v9.7: 1번 기준자세 최소 유효 비율
+
+function diagStart(){
+  diagActive=true;
+  diagIdx=0;
+  diagResults=[];
+  diagArmBaseline=null;
+  diagReferenceLocked=false;   // v9.7: 매 진단 시작 시 기준 잠금 해제
+  if(!refPose||!wristReferenceQuat){diagActive=false;setStatus('먼저 실제 시작자세를 📍 등록하세요 — 손목 진단은 등록자세 상대각을 사용합니다');return;}
+  if(diagPendingAdvance){ clearTimeout(diagPendingAdvance); diagPendingAdvance=null; }
+  diagBeginPose();
+}
+const DIAG_CAPTURE_MS=1500;      // 캡처 지속시간. 1초는 One Euro 필터가 정착하기 전에 끝나 짧았다.
+const DIAG_HAND_MIN_RATIO=0.70;  // 전체 프레임 중 유효 손 샘플 비율
+const DIAG_HAND_QUALITY_MIN=0.65; // 검출 여부가 아니라 손 기하 품질 하한
+
+function diagBeginPose(){
+  diagSamples=[];
+  diagCapturing=false;
+  diagCountdown=0;diagFramesSeen=0;diagRejectedHandQuality=0;diagRejectedFrameQuality=0;diagRejectedArmPose=0;
+  diagHandRawPresent=0;diagHandGatePassed=0;   // v9.7 3분리 카운터
+  const p=DIAG_POSES[diagIdx];
+  setStatus(`🔬 [${diagIdx+1}/${DIAG_POSES.length}] ${p.name} — ${p.setup} · [스페이스]캡처 · [B]이전 · [S]건너뛰기`);
+}
+function diagCaptureStart(){
+  if(!diagActive || diagCapturing) return;
+  diagCountdown=3;
+  setStatus(`자세 유지… 3`);
+  const iv=setInterval(()=>{
+    diagCountdown--;
+    if(diagCountdown>0){ setStatus(`자세 유지… ${diagCountdown}`); }
+    else{
+      clearInterval(iv);
+      // 첫 자세는 3초간 안정화한 현재 프레임으로 손목 영점을 다시 고정한다.
+      // 등록 버튼 한 프레임의 오차가 전체 진단에 남는 것을 막는다.
+      if(diagIdx===0){
+        if(!setWristReferenceFromCurrent()){
+          setStatus("손목 기준 재고정 실패 — 손 전체가 보이게 하고 다시 캡처");
+          return;
+        }
+      }
+      diagCapturing=true;
+      diagSamples=[];
+      setStatus(diagIdx===0?`📸 캡처 중… 손목 영점 재고정 완료, 완전히 정지`:`📸 캡처 중… 완전히 정지`);
+      setTimeout(()=>{ diagFinishPose(); }, DIAG_CAPTURE_MS);
+    }
+  },1000);
+}
+// 이전 자세로 되돌아가 재촬영. 손 검출이 실패했거나 자세를 잘못 잡았을 때 쓴다.
+function diagRetakePrev(){
+  if(!diagActive || diagCapturing) return;
+  // 경고 대기 중이면 → 방금 찍은 그 자세를 다시 찍는다 (한 칸 더 뒤로 안 감)
+  if(diagCancelPending()){
+    diagResults.pop();
+    setStatus(`↩ 재촬영 — ${DIAG_POSES[diagIdx].name}`);
+    setTimeout(()=>diagBeginPose(),600);
+    return;
+  }
+  if(diagIdx===0){ setStatus("첫 자세라 되돌아갈 곳이 없음"); return; }
+  diagIdx--;
+  diagResults.pop();
+  setStatus(`↩ 재촬영 — ${DIAG_POSES[diagIdx].name}`);
+  setTimeout(()=>diagBeginPose(),600);
+}
+function diagCollectSample(){
+  if(!diagCapturing) return;
+  diagFramesSeen++;
+  const raw=lastRawAngles;
+  const d=lastDiagData;
+  const p=DIAG_POSES[diagIdx];
+  const needsHand=(p.focus||[]).includes("손");
+  // v9.7: 손 지표 3분리 — 어느 단계에서 탈락하는지 구분
+  if(d&&d.handRawPresent===1) diagHandRawPresent++;   // ① 손이 화면에 잡힘
+  if(needsHand){
+    if(!d||d.handDetected!==1||(d.handQuality??0)<DIAG_HAND_QUALITY_MIN){diagRejectedHandQuality++;return;}
+    diagHandGatePassed++;                              // ② 게이트+품질 통과
+    if((d.wristFrameQuality??0)<WRIST_FRAME_MIN_REGISTER){diagRejectedFrameQuality++;return;}
+  }
+  // 첫 기준자세 이후에는 CH0~CH2가 거의 같아야 한다. 손목만 움직이는 진단에서
+  // 상완/팔꿈치/전완 배치가 달라지면 상대 손목축도 달라져 결과가 오염된다.
+  if(diagArmBaseline && raw){
+    const dyaw=Math.abs(V.wrap180((raw[0]??0)-diagArmBaseline[0]));
+    const dsh=Math.abs((raw[1]??0)-diagArmBaseline[1]);
+    const del=Math.abs((raw[2]??0)-diagArmBaseline[2]);
+    if(dyaw>DIAG_ARM_YAW_TOL||dsh>DIAG_ARM_SHOULDER_TOL||del>DIAG_ARM_ELBOW_TOL){
+      diagRejectedArmPose++;return;
+    }
+  }
+  if(raw && raw.some(v=>v!=null)) diagSamples.push({raw:[...raw],detail:d?{...d}:null});
+}
+function median(arr){
+  if(arr.length===0) return null;
+  const s=[...arr].sort((a,b)=>a-b);
+  return s[Math.floor(s.length/2)];
+}
+function diagFinishPose(){
+  diagCapturing=false;
+  const p=DIAG_POSES[diagIdx];
+  // 샘플들의 중앙값 (노이즈 제거)
+  const measured={};
+  const names=["baseYawInput","shoulderUD","elbow","wristUD","wristAxisTwist"];
+  for(let i=0;i<AXIS_COUNT;i++){
+    const vals=diagSamples.map(s=>s.raw[i]).filter(v=>v!=null);
+    measured[names[i]]=vals.length? Math.round(median(vals)*10)/10 : null;
+  }
+  // 측면굽힘은 로봇 축이 없어 raw[]에 안 들어간다. 혼입 판정에 반드시 필요하므로 여기서 승격한다.
+  const sbVals=diagSamples.map(s=>s.detail&&s.detail.wristSideBendDiagnostic)
+                          .filter(v=>typeof v==='number');
+  measured.wristSideBend = sbVals.length? Math.round(median(sbVals)*10)/10 : null;
+  // v9.6: 손 품질·기준축·팔 자세 고정 검사를 모두 통과한 샘플만 수집한다.
+  measured.validSampleRatio=diagFramesSeen?Math.round(diagSamples.length/diagFramesSeen*100)/100:0;
+  measured.rejectedHandQuality=diagRejectedHandQuality;
+  measured.rejectedWristFrame=diagRejectedFrameQuality;
+  measured.rejectedArmPose=diagRejectedArmPose;
+  measured.armPoseValidRatio=diagFramesSeen?Math.round((diagFramesSeen-diagRejectedArmPose)/diagFramesSeen*100)/100:0;
+  const hqVals=diagSamples.map(s=>s.detail&&s.detail.handQuality).filter(v=>typeof v==='number');
+  measured.handQuality=hqVals.length?Math.round(median(hqVals)*100)/100:null;
+  // v9.7: 손 지표 3분리 — "손 검출 0%" 오해를 없앤다
+  //   handDetectedRatio  = 손이 화면에 잡힌 비율 (게이트 이전, 진짜 검출률)
+  //   handGatePassRatio  = 게이트+품질 통과 비율
+  //   validSampleRatio   = 모든 필터 최종 통과 비율
+  measured.handDetectedRatio=diagFramesSeen?Math.round(diagHandRawPresent/diagFramesSeen*100)/100:0;
+  measured.handGatePassRatio=diagFramesSeen?Math.round(diagHandGatePassed/diagFramesSeen*100)/100:0;
+  const wdVals=diagSamples.map(s=>s.detail&&s.detail.wristDistance).filter(v=>typeof v==='number');
+  measured.wristDistanceMedian=wdVals.length?Math.round(median(wdVals)*1000)/1000:null;
+
+  // 상세 벡터 중앙값 (있으면)
+  let detailAvg=null;
+  const dets=diagSamples.map(s=>s.detail).filter(d=>d);
+  if(dets.length){
+    detailAvg={};
+    for(const k of Object.keys(dets[0])){
+      const vals=dets.map(d=>d[k]).filter(v=>typeof v==='number');
+      if(vals.length) detailAvg[k]=Math.round(median(vals)*100)/100;
+    }
+  }
+
+  // v9.7: 1번 기준자세는 유효 샘플과 비율을 둘 다 만족해야 잠금(lock)된다.
+  // 잠기지 않으면 diagAdvance가 다음 자세로 넘어가지 않고 1번을 재시도시킨다.
+  if(p.id==="wrist_reference_start"){
+    const enoughSamples=diagSamples.length>=DIAG_REF_MIN_SAMPLES;
+    const enoughRatio=measured.validSampleRatio>=DIAG_REF_MIN_RATIO;
+    const armFinite=[measured.baseYawInput,measured.shoulderUD,measured.elbow].every(Number.isFinite);
+    if(enoughSamples&&enoughRatio&&armFinite){
+      diagArmBaseline=[measured.baseYawInput,measured.shoulderUD,measured.elbow];
+      diagReferenceLocked=true;
+      // v9.7: 기준자세 확정 순간 손목 상대영점을 이 자세의 여러 프레임으로 재고정한다.
+      //       (자세 등록 버튼의 한 프레임이 아니라 3초 중앙값 기준으로 다시 잡음)
+      if(lastWristAbsoluteQuat) setWristReferenceFromCurrent();
+    } else {
+      diagReferenceLocked=false;
+    }
+  }
+
+  // 자세 품질 경고
+  const warnings=[];
+  const needsHand=(p.focus||[]).includes("손");
+  if(needsHand && measured.validSampleRatio < DIAG_HAND_MIN_RATIO){
+    warnings.push(`유효 손 샘플 ${Math.round(measured.validSampleRatio*100)}% — handQuality ${DIAG_HAND_QUALITY_MIN} 또는 기준축 ${WRIST_FRAME_MIN_REGISTER} 미달. 손 전체가 보이게 [B] 재촬영`);
+  }
+  if(diagArmBaseline && p.id!=="wrist_reference_start" && measured.armPoseValidRatio < DIAG_ARM_MIN_RATIO){
+    warnings.push(`팔 자세 유지 샘플 ${Math.round(measured.armPoseValidRatio*100)}% — 상완을 몸통에 붙이고 팔꿈치 위치를 1번과 같게 고정해 [B] 재촬영`);
+  }
+  // 손목 기준축 붕괴 검사 — 손목 자세에서 전완이 수직에 가까우면 raw3/raw4가 통째로 무의미하다
+  const fqVals=diagSamples.map(s=>s.detail&&s.detail.wristFrameQuality)
+                          .filter(v=>typeof v==='number');
+  measured.wristFrameQuality = fqVals.length? Math.round(median(fqVals)*100)/100 : null;
+  if(needsHand && measured.wristFrameQuality!=null && measured.wristFrameQuality < WRIST_FRAME_MIN_WARN){
+    warnings.push(`손목 기준축 ${Math.round(measured.wristFrameQuality*100)}% — 전완이 수직에 가까워 raw3/raw4 무의미. 전완을 눕히고 [B]로 재촬영`);
+  }
+  if(diagSamples.length < 10){
+    warnings.push(`샘플 ${diagSamples.length}개뿐 — 추적이 끊겼을 가능성`);
+  }
+  // v9.7: 손 지표 3분리 기반 진단 힌트 — 어느 단계에서 손이 탈락했는지 콕 집어준다
+  if(needsHand && measured.validSampleRatio < DIAG_HAND_MIN_RATIO){
+    if(measured.handDetectedRatio < 0.3){
+      warnings.push(`손이 화면에서 거의 안 잡힘(검출 ${Math.round(measured.handDetectedRatio*100)}%) — 손 전체를 카메라 화각 안에 [B] 재촬영`);
+    } else if(measured.handGatePassRatio < 0.3){
+      const wd=measured.wristDistanceMedian;
+      warnings.push(`손은 잡히나 팔손목점과 멀어 버려짐(거리 ${wd??'?'}) — 손을 팔 끝에 맞춰 [B] 재촬영`);
+    }
+  }
+  // v9.7: 1번 기준자세가 잠기지 않았으면 최상단 경고 (이게 실패하면 뒤 전부 무효)
+  if(p.id==="wrist_reference_start" && !diagReferenceLocked){
+    warnings.unshift(`🔴 1번 기준자세 확정 실패 — 유효샘플 ${diagSamples.length}/${DIAG_REF_MIN_SAMPLES}, 비율 ${Math.round(measured.validSampleRatio*100)}%. 이게 성공해야 2번 이후가 의미있음. [B]로 반드시 재촬영`);
+  }
+  // ── 물리 한계 검사 (2026-07-15 추가) ──
+  // 사람 몸으로 불가능한 값이 나오면 자세가 틀렸거나 랜드마크가 붕괴한 것이다.
+  const sb=measured.wristSideBend;
+  if(sb!=null && Math.abs(sb) > 50){
+    warnings.push(`측면굽힘 ${sb.toFixed(0)}° — 사람 손목 최대 ~40°. 손을 비틀었거나 손 좌표계 붕괴. [B]로 재촬영`);
+  }
+  if((p.id==="wrist_reference_start"||p.id==="wrist_reference_end") &&
+     ((measured.wristUD!=null&&Math.abs(measured.wristUD)>8)||(measured.wristAxisTwist!=null&&Math.abs(measured.wristAxisTwist)>8))){
+    warnings.push(`등록자세인데 CH3=${measured.wristUD?.toFixed(1)}°, CH4=${measured.wristAxisTwist?.toFixed(1)}° — 상대 영점 불일치. 자세를 정확히 맞춰 [B] 재촬영`);
+  }
+  if(p.id==="twist_palm_up" && measured.wristUD!=null && Math.abs(measured.wristUD)>15){
+    warnings.push(`CH4 회전 중 CH3 혼입 ${measured.wristUD.toFixed(1)}° — 손목을 곧게 유지하고 [B] 재촬영`);
+  }
+  // 팔을 곧게 펴야 하는 자세에서 팔꿈치가 굽어 있으면 깊이추정 실패 또는 자세 오류
+  if((p.id==="forward"||p.id==="up"||p.id==="rest") && measured.elbow!=null && measured.elbow > 30){
+    warnings.push(`팔꿈치 ${measured.elbow.toFixed(0)}° 굽음 (기대 0°) — 팔을 더 곧게 펴거나, 카메라와 각도를 틀어 깊이추정을 도울 것`);
+  }
+
+  diagResults.push({
+    pose:p.id, name:p.name, focus:p.focus, setup:p.setup,
+    expect:p.expect, measured, detail:detailAvg,
+    sampleCount:diagSamples.length,
+    warnings: warnings.length?warnings:undefined
+  });
+
+  if(warnings.length){
+    setStatus(`⚠ ${warnings[0]}`);
+    // 이 대기 중에 [B]/[S]가 들어오면 diagIdx가 두 번 움직여 자세가 꼬인다. 반드시 취소 가능해야 한다.
+    diagPendingAdvance=setTimeout(()=>{ diagPendingAdvance=null; diagAdvance(); }, 2200);
+  } else {
+    diagAdvance();
+  }
+}
+function diagCancelPending(){
+  if(diagPendingAdvance){ clearTimeout(diagPendingAdvance); diagPendingAdvance=null; return true; }
+  return false;
+}
+function diagAdvance(){
+  // v9.7: 1번 기준자세가 잠기지 않았으면 다음으로 넘어가지 않고 1번을 다시 찍게 한다.
+  // v9.6은 1번이 실패해도 2~7번으로 그냥 진행해 전체가 무효가 됐다.
+  const cur=DIAG_POSES[diagIdx];
+  if(cur && cur.id==="wrist_reference_start" && !diagReferenceLocked){
+    diagResults.pop();   // 실패한 1번 결과 제거 (재촬영으로 대체)
+    setStatus("↩ 1번 기준자세 재촬영 — 손 전체가 보이고 유효샘플이 충분해야 다음으로 넘어갑니다");
+    setTimeout(()=>diagBeginPose(),900);
+    return;
+  }
+  diagIdx++;
+  if(diagIdx>=DIAG_POSES.length) diagComplete();
+  else diagBeginPose();
+}
+function diagComplete(){
+  diagActive=false;
+  $btnDiag.textContent="🔬 진단 완료 (내보내기)";
+  $btnDiag.classList.add("on");
+  const bad=diagResults.filter(r=>r.warnings).length;
+  setStatus(bad
+    ? `✅ 진단 완료 — 단, ${bad}개 자세에 경고 있음. JSON의 warnings 확인. 🔬 버튼으로 내보내기`
+    : "✅ 진단 완료! 🔬 버튼 다시 눌러 결과 파일 내보내기");
+}
+// ══════════════════════════════════════════════════════════
+// 자동 분석 — JSON을 사람이 읽고 부호를 추측하는 과정을 없앤다.
+// 여기서 나오는 게 결국 MAP_CFG.dir 과 "혼입이 있냐 없냐" 두 가지다.
+// ══════════════════════════════════════════════════════════
+function diagAnalyze(){
+  const by={};for(const r of diagResults)if(!r.skipped)by[r.pose]=r;
+  const g=(id,key)=>{const v=by[id]?.measured?.[key];return typeof v==='number'?v:null;};
+  const r1=v=>v==null?null:Math.round(v*10)/10;
+  const cmp=(a,b,tol=5)=>a==null||b==null?null:(Math.abs(a-b)<tol?0:(a>b?1:-1));
+
+  const s3=g('wrist_reference_start','wristUD'),s4=g('wrist_reference_start','wristAxisTwist');
+  const e3=g('wrist_reference_end','wristUD'),e4=g('wrist_reference_end','wristAxisTwist');
+  const f3=g('wrist_flex','wristUD'),x3=g('wrist_ext','wristUD');
+  const up4=g('twist_palm_up','wristAxisTwist');
+  const contamination=[];
+  for(const id of ['wrist_dev_thumb','wrist_dev_pinky']){
+    if(!by[id])continue;
+    const leak3Raw=g(id,'wristUD'),leak4Raw=g(id,'wristAxisTwist');
+    const leak3=(leak3Raw==null||s3==null)?null:leak3Raw-s3;
+    const leak4=(leak4Raw==null||s4==null)?null:leak4Raw-s4;
+    // v9.7: null을 0으로 취급해 "OK"로 판정하던 버그 수정.
+    // 데이터가 없으면 반드시 '데이터 부족'으로 나와야 한다.
+    let verdict;
+    if(leak3==null||leak4==null){
+      verdict='데이터 부족 — 이 자세 측정 실패, 판정 불가';
+    } else {
+      const worst=Math.max(Math.abs(leak3),Math.abs(leak4));
+      verdict=worst<5?'OK':worst<10?'주의 — 허용 상한 근처':'불량 — 혼입 10° 초과';
+    }
+    contamination.push({pose:id,sideBendDeg:g(id,'wristSideBend'),
+      leakIntoCH3Deg:r1(leak3),leakIntoCH4Deg:r1(leak4),verdict});
+  }
+  return {
+    wristReferenceMode:{
+      method:'v9.7 qDelta = qCurrent × conjugate(qReference), swing/twist. 손게이트0.28·기준잠금·null안전',
+      start:{CH3:s3,CH4:s4},end:{CH3:e3,CH4:e4},
+      // v9.7: null이면 드리프트도 null (0으로 위장 금지)
+      drift:{CH3:(s3!=null&&e3!=null)?r1(e3-s3):null,CH4:(s4!=null&&e4!=null)?r1(e4-s4):null},
+      verdict:(s3==null||s4==null||e3==null||e4==null)?'데이터 부족 — 시작/종료 기준 측정 실패':
+        (Math.abs(e3-s3)<5&&Math.abs(e4-s4)<5?'OK — 재현성 통과':'불량 — 시작자세 복귀 오차 5° 초과')
+    },
+    CH3_wristUpDown:{
+      referenceDeg:s3,flexionDeg:f3,extensionDeg:x3,
+      deltaFlexion:(f3!=null&&s3!=null)?r1(f3-s3):null,
+      deltaExtension:(x3!=null&&s3!=null)?r1(x3-s3):null,
+      flexionIsPositive:cmp(f3,x3,5),humanRomDeg:(f3!=null&&x3!=null)?r1(Math.abs(f3-x3)):null,
+      robotSpanDeg:87,requiredGain:(f3!=null&&x3!=null&&Math.abs(f3-x3)>1)?r1(87/Math.abs(f3-x3)):null,
+      dataStatus:(f3==null||x3==null||s3==null)?'데이터 부족 — 굴곡/신전/기준 중 측정 실패':'측정됨'
+    },
+    CH4_wristTwistOneWay:{
+      referenceDeg:s4,palmUpDeg:up4,positiveDeltaDeg:(up4!=null&&s4!=null)?r1(up4-s4):null,
+      direction:cmp(up4,s4,5),robotSpanDeg:85,
+      dataStatus:(up4==null||s4==null)?'데이터 부족 — 손바닥하늘/기준 중 측정 실패':'측정됨',
+      policy:'등록자세=0/로봇18.32°. 하늘 방향만 0→85° 매핑. 반대 방향 로봇 출력은 18.32°에 고정'
+    },
+    contamination:{poses:contamination,passThresholdDeg:10,note:'요측·척측편위 중 CH3/CH4 절대값이 10° 미만이어야 1차 통과'},
+    quality:{posesCaptured:diagResults.filter(r=>!r.skipped).length,posesExpected:DIAG_POSES.length,
+      posesSkipped:diagResults.filter(r=>r.skipped).map(r=>r.pose),
+      posesWithWarnings:diagResults.filter(r=>r.warnings).map(r=>({pose:r.pose,warnings:r.warnings})),
+      handGeometryQualityMin:DIAG_HAND_QUALITY_MIN,wristFrameQualityMin:WRIST_FRAME_MIN_REGISTER,
+      armPoseToleranceDeg:{yaw:DIAG_ARM_YAW_TOL,shoulder:DIAG_ARM_SHOULDER_TOL,elbow:DIAG_ARM_ELBOW_TOL},
+      armPoseMinValidRatio:DIAG_ARM_MIN_RATIO}
+  };
+}
+
+function diagExport(){
+  const report={
+    version:"v9.7.0-hand-gate-relaxed-reference-lock-null-safe",
+    timestamp:new Date().toISOString(),
+    arm:currentArm,
+    frame:"CH0~CH2는 몸통 기준 절대각. CH3~CH4는 등록자세 wristReferenceQuat 대비 상대 swing/twist 각도.",
+    axes:{
+      baseYawInput:"raw0 CH0 어깨 좌우 방위각 · 연속 누적값 · 팔이 수직이면 갱신 정지",
+      shoulderUD:"raw1 CH1 어깨 상하 · 아래=0° 수평=90° 위=180°",
+      elbow:"raw2 CH2 팔꿈치 굽힘 · 편 팔=0° L자=90°",
+      wristUD:"raw3 CH3 등록자세 대비 손목 상하 (qDelta swing X)",
+      wristAxisTwist:"raw4 CH4 등록자세 대비 축회전 (qDelta twist Z) · 누적기 없음",
+      wristSideBend:"측면굽힘 (swing Y) · 로봇 축 없음 · 혼입 판정 전용"
+    },
+    analysis:diagAnalyze(),
+    poses:diagResults
+  };
+  const blob=new Blob([JSON.stringify(report,null,2)],{type:"application/json"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url; a.download=`armvec_diag_v97_wrist7_${Date.now()}.json`;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  setStatus("📁 진단 결과 저장됨 — analysis 블록에 상대영점·CH3/CH4 방향·혼입·드리프트 판정이 들어 있음");
+  setTimeout(()=>{$status.style.opacity=0;},2800);
+}
+// render가 매 프레임 채우는 상세 진단 데이터
+let lastDiagData=null;
+
+async function connectRobot(){
+  if(!hardwareConfigValid()){
+    setStatus("🔒 하드웨어 보정 잠금 — CH0~CH4 중앙·방향·펄스·안전범위와 새 CH4 축회전 ROM을 입력해야 연결됩니다");
+    return;
+  }
+  if(!("serial" in navigator)){
+    setStatus("⚠ Web Serial 미지원 — 크롬/엣지 데스크톱에서 열어야 함 (폰·파이어폭스·사파리 불가)");
+    return;
+  }
+  try{
+    // 포트 선택 (사용자가 아두이노 골라야 함)
+    serialPort=await navigator.serial.requestPort();
+  }catch(err){
+    // 사용자가 팝업 취소했거나 포트 없음
+    setStatus("포트 선택 취소됨 — 아두이노가 목록에 없으면 USB 연결/드라이버 확인");
+    return;
+  }
+  try{
+    await serialPort.open({ baudRate:115200 });
+  }catch(err){
+    // 이미 다른 프로그램이 포트 점유 (제일 흔한 원인)
+    if(String(err).includes("locked")||String(err).includes("in use")||String(err).includes("Failed to open")){
+      setStatus("⚠ 포트가 이미 사용 중 — 아두이노 IDE의 '시리얼 모니터'를 닫고 다시 시도");
+    } else {
+      setStatus("포트 열기 실패: "+err.message);
+    }
+    try{ await serialPort.close(); }catch(e){}
+    serialPort=null;
+    return;
+  }
+  try{
+    serialWriter=serialPort.writable.getWriter();
+    robotConnected=true;
+    $btnRobot.textContent="🤖 로봇 연결됨";
+    $btnRobot.classList.add("on");
+    setStatus("로봇 연결됨 — 통신 확인 중…");
+
+    // 아두이노 응답 읽기 (READY/CENTERED 확인) — 백그라운드
+    startSerialReader();
+
+    // 펌웨어는 안전상 PWM OFF로 부팅. 명시적으로 활성화한 뒤 STOW 자세로 이동.
+    await new Promise(r=>setTimeout(r,1800));
+    await sendRaw("E\n");
+    await new Promise(r=>setTimeout(r,120));
+    await sendRaw("C\n");
+
+    setTimeout(()=>{
+      setStatus(`✅ 로봇 준비 완료 — 보정된 5축 STOW [${ROBOT_STOW_POSE.join(", ")}]로 정렬됨. 자세 등록 후 엔터로 시동`);
+      setTimeout(()=>{$status.style.opacity=0;},1800);
+    },600);
+  }catch(err){
+    setStatus("Writer 생성 실패: "+err.message);
+    robotConnected=false;
+  }
+}
+
+// 아두이노 → 브라우저 응답 읽기 (연결 확인용)
+let serialReader=null, readerActive=false;
+async function startSerialReader(){
+  if(!serialPort||!serialPort.readable) return;
+  readerActive=true;
+  try{
+    serialReader=serialPort.readable.getReader();
+    const decoder=new TextDecoder();
+    let lineBuf="";
+    while(readerActive){
+      const {value,done}=await serialReader.read();
+      if(done) break;
+      lineBuf+=decoder.decode(value,{stream:true});
+      let nl;
+      while((nl=lineBuf.indexOf("\n"))>=0){
+        const msg=lineBuf.slice(0,nl).trim();
+        lineBuf=lineBuf.slice(nl+1);
+        if(msg) handleArduinoMsg(msg);
+      }
+    }
+  }catch(err){
+    // 읽기 중단 (연결 해제 등) — 무시
+  }finally{
+    try{ serialReader && serialReader.releaseLock(); }catch(e){}
+    serialReader=null;
+  }
+}
+let arduinoAlive=false;
+function handleArduinoMsg(msg){
+  // READY / CENTERING / CENTERED / OK / ERR
+  if(msg==="READY"||msg==="READY_PWM_OFF"||msg==="ENABLED"||msg==="CENTERED"||msg==="OK"){
+    arduinoAlive=true;  // 아두이노가 살아서 응답 = 통신 정상
+  }
+}
+
+// 저수준 전송 (문자열 그대로)
+async function sendRaw(str){
+  if(!serialWriter) return;
+  try{ await serialWriter.write(new TextEncoder().encode(str)); }catch(e){}
+}
+
+async function disconnectRobot(){
+  try{ if(serialWriter) await sendRaw("X\n"); }catch(e){}
+  robotConnected=false;
+  readerActive=false;
+  arduinoAlive=false;
+  try{
+    if(serialReader){ await serialReader.cancel(); serialReader.releaseLock(); serialReader=null; }
+  }catch(e){}
+  try{
+    if(serialWriter){ serialWriter.releaseLock(); serialWriter=null; }
+    if(serialPort){ await serialPort.close(); serialPort=null; }
+  }catch(e){}
+  $btnRobot.textContent="🤖 로봇 연결";
+  $btnRobot.classList.remove("on");
+}
+
+async function sendToRobot(servos){
+  if(!robotConnected||!serialWriter||!hardwareConfigValid())return;
+  if(!Array.isArray(servos)||servos.length!==AXIS_COUNT||!servos.every(Number.isFinite))return;
+  const now=performance.now();
+  if(now-lastRobotSend<ROBOT_INTERVAL) return;
+  lastRobotSend=now;
+  // 정확히 "a0,a1,a2,a3,a4\n"만 전송한다. 추가 출력축은 존재하지 않는다.
+  const line=servos.map(a=>Number(a).toFixed(1)).join(",")+"\n";
+  try{
+    await serialWriter.write(new TextEncoder().encode(line));
+  }catch(err){
+    setStatus("전송 끊김: "+err.message);
+    robotConnected=false;
+  }
+}
+
+
+function setStatus(msg){
+  $status.style.opacity=1;
+  $status.textContent=msg;
+}
+
+
+$btnStart.onclick=async()=>{ await startCamera(); $btnStart.disabled=true; };
+$btnFlip.onclick=async()=>{
+  if(romActive){ setStatus("측정 중에는 카메라를 전환할 수 없습니다"); return; }
+  facing=(facing==="user")?"environment":"user";
+  refPose=null;calibRef=null;clearWristReference();
+  try{localStorage.removeItem(REFPOSE_STORAGE_KEY);}catch(e){}
+  $btnCalib.textContent="📍 자세 등록";$btnCalib.classList.remove("on");
+  if(running) await startCamera(); else applyMirror();
+  setStatus("카메라를 바꿔 기존 자세·손목 기준을 삭제했습니다. 다시 등록하세요");
+};
+$btnArm.onclick=()=>{
+  if(romActive){ setStatus("측정 중에는 팔을 전환할 수 없습니다"); return; }
+  currentArm=(currentArm==="right")?"left":"right";
+  $btnArm.textContent="팔: "+(currentArm==="right"?"오른쪽":"왼쪽");
+  refPose=null;calibRef=null;clearWristReference();
+  try{localStorage.removeItem(REFPOSE_STORAGE_KEY);}catch(e){}
+  $btnCalib.textContent="📍 자세 등록";$btnCalib.classList.remove("on");
+  resetAllFilters();setStatus("팔을 바꿔 기존 자세·손목 기준을 삭제했습니다. 다시 등록하세요");
+};
+$btnMirror.onclick=()=>{
+  mirrorOn=!mirrorOn;
+  $btnMirror.textContent="좌우반전: "+(mirrorOn?"켬":"끔");
+  $btnMirror.classList.toggle("on",mirrorOn);
+  applyMirror();
+};
+$btnQuality.onclick=()=>{
+  if(romActive){ setStatus("측정 중에는 모델을 바꿀 수 없습니다"); return; }
+  quality=(quality==="heavy")?"full":"heavy";
+  $btnQuality.textContent="모델: "+(quality==="heavy"?"Heavy":"Full");
+  $status.style.opacity=1;
+  $status.textContent="모델 교체 중… 다시 로딩";
+  spawnWorkers();
+};
+$btnRobot.onclick=async()=>{
+  if(robotConnected) await disconnectRobot();
+  else if(romActive){
+    setStatus("측정 중에는 로봇 연결이 차단됩니다");
+    setTimeout(()=>{$status.style.opacity=0;},1600);
+  }else await connectRobot();
+};
+
+// ── 진단 모드 버튼 ──
+$btnDiag.onclick=()=>{
+  if(romActive){
+    setStatus("최고 가동범위 측정을 먼저 종료하세요");
+    setTimeout(()=>{$status.style.opacity=0;},1700); return;
+  }
+  if(!running){
+    setStatus("먼저 ▶ 시작을 눌러 카메라를 켜세요");
+    setTimeout(()=>{$status.style.opacity=0;},1800); return;
+  }
+  if(diagResults.length>0 && !diagActive){
+    // 완료 상태 → 내보내기
+    diagExport();
+    $btnDiag.textContent="🔬 진단 모드";
+    $btnDiag.classList.remove("on");
+    diagResults=[];
+    return;
+  }
+  if(diagActive){
+    // 진행 중 → 중단
+    diagActive=false; diagCapturing=false;
+    $btnDiag.textContent="🔬 진단 모드";
+    $btnDiag.classList.remove("on");
+    setStatus("진단 중단됨");
+    setTimeout(()=>{$status.style.opacity=0;},1500);
+    return;
+  }
+  // 시작
+  $btnDiag.textContent="🔬 진단 중 (중단하려면 클릭)";
+  $btnDiag.classList.add("on");
+  diagStart();
+  if(!diagActive){$btnDiag.textContent="🔬 진단 모드";$btnDiag.classList.remove("on");}
+};
+
+// ── 최고 가동범위 측정 버튼 ──
+$btnRom.onclick=async()=>{
+  if(romResult && !romActive){ await romExport(); return; }
+  if(romActive){
+    if(romPhase==="measuring") romFinishCurrentAxis();
+    else romCancel();
+    return;
+  }
+  await romStart();
+};
+
+// ── 시동 자세: 카운트다운 후 현재 팔 각도를 0점으로 저장 ──
+// ══ 기준 자세 등록 (btnCalib 재활용) ══
+let calibTimer=null;
+$btnCalib.onclick=()=>{
+  if(romActive){
+    setStatus("측정 중에는 기준 자세를 다시 등록할 수 없습니다");
+    setTimeout(()=>{$status.style.opacity=0;},1700); return;
+  }
+  if(calibTimer){ return; }
+  // 3초 카운트다운 후 현재 자세를 '기준 자세'로 등록 (localStorage 저장)
+  let cnt=3;
+  setStatus(`기준 자세를 취하세요 — 아래팔을 수직으로 세우지 말 것! (수평~45°) · ${cnt}초 후 등록`);
+  calibTimer=setInterval(()=>{
+    cnt--;
+    if(cnt>0){ setStatus(`기준 자세 유지… ${cnt}`); }
+    else{
+      clearInterval(calibTimer); calibTimer=null;
+      const r=lastRawAngles;
+      if(!r || r.every(v=>v==null)){
+        setStatus("팔이 안 잡혀 — 상체가 다 보이게 하고 다시");
+        setTimeout(()=>{$status.style.opacity=0;},1800); return;
+      }
+      // ★시작 자세 가드★ (2026-07-15 추가)
+      // 전완이 수직에 가까우면 손목 기준축(downRef)이 붕괴한다. 그 자세로 등록하면
+      // 이후 모든 CH3/CH4 delta가 무너진 기준 위에 쌓인다. 등록 자체를 막는다.
+      const q=lastWristFrameQuality;
+      if(q!=null && q<WRIST_FRAME_MIN_REGISTER){
+        const elev=Math.round(Math.asin(Math.min(1,q))*180/Math.PI);
+        setStatus(`🔴 등록 거부 — 아래팔이 수직에 너무 가까움 (기준축 ${(q*100).toFixed(0)}%, 필요 ${WRIST_FRAME_MIN_REGISTER*100}%). 아래팔을 더 눕혀서 다시 (수평~45° 권장)`);
+        setTimeout(()=>{$status.style.opacity=0;},4000); return;
+      }
+      if(q==null||!lastWristAbsoluteQuat){
+        setStatus("손이 안 잡혀 — 손목 상대회전 기준을 저장할 수 없어. 손 전체가 보이게 하고 다시");
+        setTimeout(()=>{$status.style.opacity=0;},2500); return;
+      }
+      if((lastHandQuality??0)<DIAG_HAND_QUALITY_MIN){
+        setStatus(`🔴 등록 거부 — 손 기하 품질 ${Math.round((lastHandQuality??0)*100)}%, 필요 ${Math.round(DIAG_HAND_QUALITY_MIN*100)}%. 손가락 뿌리와 손목이 모두 보이게 다시`);
+        setTimeout(()=>{$status.style.opacity=0;},3500); return;
+      }
+      // 사람 시작자세 고정: 상완은 몸통 옆, 팔꿈치는 약 90°, 전완은 앞쪽.
+      // MediaPipe 깊이 오차를 고려해 넓은 허용범위를 사용한다.
+      const startSh=r[1],startEl=r[2];
+      if(!Number.isFinite(startSh)||!Number.isFinite(startEl)||startSh>40||startEl<55||startEl>115){
+        setStatus(`🔴 등록 거부 — 시작 팔 자세가 다름 (어깨상하 ${Number.isFinite(startSh)?startSh.toFixed(0):'--'}°, 팔꿈치 ${Number.isFinite(startEl)?startEl.toFixed(0):'--'}°). 상완을 몸통 옆에 붙이고 팔꿈치를 약 90°로 굽혀 다시`);
+        setTimeout(()=>{$status.style.opacity=0;},4500); return;
+      }
+      if(!setWristReferenceFromCurrent()){
+        setStatus("손목 기준 쿼터니언 저장 실패 — 손을 다시 잡고 등록하세요");return;
+      }
+      // CH3/CH4는 이제 등록자세 대비 상대각이므로 기준값은 정확히 0이다.
+      refPose=[r[0]??rawDefaultRef[0],r[1]??rawDefaultRef[1],r[2]??rawDefaultRef[2],0,0];
+      calibRef=null;
+      sysState='idle';
+      matchHoldStart=0;
+      try{ localStorage.setItem(REFPOSE_STORAGE_KEY, JSON.stringify(refPose)); }catch(e){}
+      $btnCalib.textContent="📍 자세 등록됨";
+      $btnCalib.classList.add("on");
+      setStatus(`✅ 기준 자세 등록 완료 (기준축 ${(lastWristFrameQuality*100).toFixed(0)}%) — 시동 트리거(엔터/박수2) 후 이 자세 취하면 시동`);
+      setTimeout(()=>{$status.style.opacity=0;},2500);
+    }
+  },1000);
+};
+
+// ── 시동 트리거: idle → arming ──
+function armSystem(){
+  if(!hardwareConfigValid()){
+    setStatus("🔒 하드웨어 보정이 끝나지 않아 실제 로봇 시동이 차단되어 있습니다");
+    return;
+  }
+  if(romActive){
+    setStatus("물리 5축 ROM·혼입 측정 중에는 로봇을 시동할 수 없습니다");
+    setTimeout(()=>{$status.style.opacity=0;},1800); return;
+  }
+  if(!refPose){
+    setStatus("먼저 '기준 자세'를 등록하세요 (📍 버튼)");
+    setTimeout(()=>{$status.style.opacity=0;},2000); return;
+  }
+  if(!robotConnected){
+    setStatus("먼저 로봇을 연결하세요 (🤖 버튼)");
+    setTimeout(()=>{$status.style.opacity=0;},2000); return;
+  }
+  sysState='arming';
+  matchHoldStart=0;
+  setStatus(`🎯 시동 준비 — 로봇이 보정된 수직 STOW [${ROBOT_STOW_POSE.join(", ")}]로 이동합니다. 등록 자세를 취하세요`);
+}
+// ── 대기 트리거: active/arming → idle ──
+function disarmSystem(){
+  sysState='idle';
+  matchHoldStart=0;
+  setStatus("⏸ 대기 상태 — 로봇 정지. 다시 시동하려면 트리거(엔터/박수2)");
+  setTimeout(()=>{$status.style.opacity=0;},1800);
+}
+// 상태 토글 (시동 트리거 키/박수가 부름)
+function toggleArm(){
+  if(sysState==='idle') armSystem();
+  else disarmSystem();  // arming이나 active면 대기로
+}
+
+$btnLock.onclick=()=>{
+  if(personLocked){
+    // 락 해제
+    personLocked=false;
+    lockSig=null;
+    lockLostFrames=0;
+    $btnLock.textContent="🔒 인물 고정";
+    $btnLock.classList.remove("on");
+    setStatus("인물 고정 해제 — 가장 가까운 사람 자동 추적");
+    setTimeout(()=>{$status.style.opacity=0;},1200);
+  } else {
+    // 지금 추적 중인 사람을 락. 현재 프레임에서 지문 추출
+    if(!lastPose||!lastPose.landmarks||lastPose.landmarks.length===0){
+      setStatus("고정할 사람이 없어 — 먼저 화면에 들어와");
+      setTimeout(()=>{$status.style.opacity=0;},1500);
+      return;
+    }
+    // 락 걸기 직전엔 아직 personLocked=false라 choosePersonIndex가 '제일 가까운 사람' 반환
+    const idx=choosePersonIndex(lastPose);
+    if(idx<0){ setStatus("사람 인식 실패 — 다시 시도"); return; }
+    const sig=personSignature(lastPose.landmarks[idx]);
+    if(!sig){ setStatus("어깨가 안 보여 — 상체가 다 나오게"); return; }
+    lockSig={...sig};
+    personLocked=true;
+    lockLostFrames=0;
+    $btnLock.textContent="🔓 고정 중";
+    $btnLock.classList.add("on");
+    setStatus("이 사람에게 고정됨 — 타인이 들어와도 유지");
+    setTimeout(()=>{$status.style.opacity=0;},1500);
+  }
+};
+
+if(!window.isSecureContext){
+  $status.textContent=`⚠ 이 주소(${location.protocol})에선 카메라 API가 잠겨 있어. HTTPS 또는 localhost로 열어야 함.`;
+}
+let resizeTimer=null;
+window.addEventListener("resize",()=>{
+  if(!running) return;
+  clearTimeout(resizeTimer); resizeTimer=setTimeout(resizeCanvases,150);
+});
+
+// 키보드 단축키: Space=시작/진단캡처, B=진단 재촬영, S=진단 건너뛰기,
+//                G=가동범위 단계완료, L=인물고정, M=반전, A=팔전환, Q=모델, R=자세등록, Enter=시동/대기
+window.addEventListener("keydown",(e)=>{
+  if(e.repeat) return;
+  const k=e.key.toLowerCase();
+  if(k===" "){
+    e.preventDefault();
+    if(diagActive){ diagCaptureStart(); }         // 진단 중이면 캡처
+    else if(!$btnStart.disabled){ $btnStart.click(); }  // 아니면 시작
+  }
+  else if(k==="l") $btnLock.click();
+  else if(k==="m") $btnMirror.click();
+  else if(k==="a") $btnArm.click();
+  else if(k==="q") $btnQuality.click();
+  else if(k==="r") $btnCalib.click();  // R = 기준자세 등록(Register)
+  else if(k==="g") $btnRom.click();      // G = 최고 가동범위 측정
+  else if(k==="enter"){ e.preventDefault(); toggleArm(); }  // 엔터 = 시동/대기
+  else if(k==="s" && diagActive){ diagSkip(); }        // 진단 중 S = 이 자세 건너뛰기
+  else if(k==="b" && diagActive){ diagRetakePrev(); }  // 진단 중 B = 이전 자세로 되돌아가 재촬영
+});
+// 진단 자세 건너뛰기
+function diagSkip(){
+  if(!diagActive || diagCapturing) return;
+  if(diagCancelPending()) return;   // 경고 대기 중이면 그 대기만 끊고, 이미 기록된 결과는 유지
+  diagResults.push({ pose:DIAG_POSES[diagIdx].id, name:DIAG_POSES[diagIdx].name,
+                     skipped:true });
+  diagAdvance();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Arm Vector — Robot Control v7.3</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:system-ui,sans-serif; background:#0a0d12; color:#e8eef4;
+         height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
+  #stage { position:relative; flex:1; min-height:0; background:#000; overflow:hidden; }
+  video, canvas#overlay { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #stage.mirror video, #stage.mirror canvas#overlay { transform:scaleX(-1); }
+
+  canvas#view3d { position:absolute; top:12px; right:12px;
+                  width:240px; height:240px;
+                  background:rgba(8,11,18,.72);
+                  border:1px solid #25323f; border-radius:14px;
+                  backdrop-filter:blur(4px); }
+  #hud { position:absolute; top:12px; left:12px;
+         font:12px/1.6 ui-monospace,monospace;
+         background:rgba(8,11,18,.66); border:1px solid #1d2733;
+         border-radius:12px; padding:11px 14px;
+         pointer-events:none; white-space:pre;
+         backdrop-filter:blur(4px); }
+  #status { position:absolute; bottom:14px; left:0; right:0; text-align:center;
+            font-size:13px; color:#cfe0f0; text-shadow:0 1px 3px #000; padding:0 16px;
+            transition:opacity 0.4s; }
+  #bar { display:flex; gap:8px; padding:12px;
+         padding-bottom:calc(12px + env(safe-area-inset-bottom)); background:#0f141b;
+         flex-wrap:wrap; }
+  button { flex:1; min-width:120px; padding:13px 0; font-size:14px; font-weight:600;
+           color:#e8eef4; background:#1a2330; border:1px solid #28384a; border-radius:12px;
+           cursor:pointer; transition:background .12s; }
+  button:hover { background:#22303f; }
+  button:active { background:#2c3d4f; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.on { background:#1d3a2c; border-color:#2e6b4d; }
+  .c-upper { color:#ff9e57; }
+  .c-fore  { color:#7be0a8; }
+  .c-palm  { color:#a8b8ff; }
+  .c-yaw   { color:#ff7eaa; }
+  .c-fps   { color:#ffd479; }
+  .c-srv   { color:#6fd3e8; }
+  .c-perf  { color:#8696a8; }
+  .dim     { color:#5e6b7a; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+  <canvas id="view3d" width="240" height="240"></canvas>
+  <div id="hud" hidden></div>
+  <div id="status">▶ 시작을 누르면 카메라 권한을 물어봐 (v7.3 · Robot Control)</div>
+</div>
+<div id="bar">
+  <button id="btnStart">▶ 시작</button>
+  <button id="btnFlip">카메라 전환</button>
+  <button id="btnArm">팔: 오른쪽</button>
+  <button id="btnMirror" class="on">좌우반전: 켬</button>
+  <button id="btnQuality">모델: Heavy</button>
+  <button id="btnRobot">🤖 로봇 연결</button>
+</div>
+
+<!-- ============================================================
+     워커 (클래식 — CommonJS 번들 eval)
+============================================================ -->
+<script type="text/js-worker" id="workerSrc">
+let landmarker = null;
+let kind = null;
+let busy = false;
+let lastTs = 0;
+
+self.onmessage = async (e) => {
+  const msg = e.data;
+
+  if (msg.type === "init") {
+    kind = msg.kind;
+    try {
+      const r = await fetch(msg.bundleUrl);
+      if (!r.ok) throw new Error("번들 다운로드 실패 HTTP " + r.status);
+      const code = await r.text();
+
+      // CommonJS 번들(.cjs) → exports/module 주입해서 eval
+      const moduleShim = { exports: {} };
+      (new Function("exports", "module", "self", "globalThis", code))(
+        moduleShim.exports, moduleShim, self, self
+      );
+      const lib = moduleShim.exports;
+      if (!lib || !lib.FilesetResolver) {
+        throw new Error("vision 객체를 못 찾음 (번들 구조 변경 가능성)");
+      }
+      const { FilesetResolver, PoseLandmarker, HandLandmarker } = lib;
+      const fileset = await FilesetResolver.forVisionTasks(msg.wasmRoot);
+
+      async function build(delegate) {
+        if (kind === "pose") {
+          return await PoseLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: msg.modelUrl, delegate },
+            runningMode: "VIDEO",
+            numPoses: 1,
+            minPoseDetectionConfidence: msg.opts.minDet,
+            minPosePresenceConfidence: msg.opts.minPres,
+            minTrackingConfidence: msg.opts.minTrack,
+            outputSegmentationMasks: false
+          });
+        }
+        return await HandLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: msg.modelUrl, delegate },
+          runningMode: "VIDEO",
+          numHands: 2,
+          minHandDetectionConfidence: msg.opts.minDet,
+          minHandPresenceConfidence: msg.opts.minPres,
+          minTrackingConfidence: msg.opts.minTrack
+        });
+      }
+
+      try {
+        landmarker = await build("GPU");
+        self.postMessage({ type: "ready", kind, delegate: "GPU" });
+      } catch (gpuErr) {
+        landmarker = await build("CPU");
+        self.postMessage({ type: "ready", kind, delegate: "CPU" });
+      }
+    } catch (err) {
+      self.postMessage({ type: "error", kind, message: String(err && err.message || err) });
+    }
+    return;
+  }
+
+  if (msg.type === "frame" && landmarker && !busy) {
+    busy = true;
+    let bmp = msg.bitmap;
+    try {
+      let ts = msg.ts;
+      if (ts <= lastTs) ts = lastTs + 1;
+      lastTs = ts;
+
+      const t0 = performance.now();
+      const result = landmarker.detectForVideo(bmp, ts);
+      const t1 = performance.now();
+
+      self.postMessage({
+        type: "result",
+        kind,
+        result: {
+          landmarks: result.landmarks || [],
+          worldLandmarks: result.worldLandmarks || [],
+          handedness: result.handedness || result.handednesses || []
+        },
+        ms: t1 - t0
+      });
+    } catch (err) {
+      self.postMessage({ type: "error", kind, message: String(err && err.message || err) });
+    } finally {
+      try { bmp && bmp.close && bmp.close(); } catch (e) {}
+      busy = false;
+    }
+  }
+};
+</script>
+
+<script type="module">
+// ════════════════════════════════════════════════════════
+// 설정 — 0.10.35 (최신 안정판), heavy 모델
+// ════════════════════════════════════════════════════════
+const VER = "0.10.35";
+const WASM_ROOT  = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}/wasm`;
+const BUNDLE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}/vision_bundle.cjs`;
+
+const POSE_MODELS = {
+  heavy: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+  full:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+};
+const HAND_MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// 신뢰도 — 높을수록 헛검출↓, 안정↑ (노트북 고품질이라 약간 높게)
+const CONF = { minDet: 0.6, minPres: 0.6, minTrack: 0.6 };
+
+const POSE_IDX = { LSh:11, RSh:12, LElb:13, RElb:14, LWr:15, RWr:16, LHip:23, RHip:24 };
+const HAND_IDX = { Wr:0, ThumbCmc:1, IndexMcp:5, MiddleMcp:9, RingMcp:13, PinkyMcp:17,
+                   ThumbTip:4, IndexTip:8, MiddleTip:12, RingTip:16, PinkyTip:20 };
+// 손가락 연결 (3D뷰용)
+const HAND_BONES = [
+  [0,1],[1,2],[2,3],[3,4],        // 엄지
+  [0,5],[5,6],[6,7],[7,8],        // 검지
+  [5,9],[9,10],[10,11],[11,12],   // 중지
+  [9,13],[13,14],[14,15],[15,16], // 약지
+  [13,17],[17,18],[18,19],[19,20],// 새끼
+  [0,17]                          // 손바닥 아랫변
+];
+
+let currentArm = "right";
+let mirrorOn = true;
+let quality = "heavy";
+
+// ════════════════════════════════════════════════════════
+// 3D 벡터 유틸
+// ════════════════════════════════════════════════════════
+const V = {
+  sub:(a,b)=>({x:a.x-b.x,y:a.y-b.y,z:a.z-b.z}),
+  add:(a,b)=>({x:a.x+b.x,y:a.y+b.y,z:a.z+b.z}),
+  scale:(a,s)=>({x:a.x*s,y:a.y*s,z:a.z*s}),
+  dot:(a,b)=>a.x*b.x+a.y*b.y+a.z*b.z,
+  cross:(a,b)=>({x:a.y*b.z-a.z*b.y, y:a.z*b.x-a.x*b.z, z:a.x*b.y-a.y*b.x}),
+  len:(a)=>Math.hypot(a.x,a.y,a.z),
+  norm:(a)=>{const L=V.len(a); return L<1e-9?{x:0,y:0,z:0}:V.scale(a,1/L);},
+  angle:(a,b)=>{
+    const c=Math.max(-1,Math.min(1,V.dot(V.norm(a),V.norm(b))));
+    return Math.acos(c)*180/Math.PI;
+  }
+};
+
+// ════════════════════════════════════════════════════════
+// One Euro Filter (3D) — 고품질이라 더 부드럽게 튜닝
+// ════════════════════════════════════════════════════════
+class OneEuro3D {
+  constructor(minCutoff=1.0, beta=0.007, dCutoff=1.0){
+    this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff;
+    this.x=null; this.dx={x:0,y:0,z:0}; this.t=null;
+  }
+  alpha(cutoff,dt){const r=2*Math.PI*cutoff*dt; return r/(r+1);}
+  filter(p,t){
+    if(this.x===null){this.x={x:p.x,y:p.y,z:p.z}; this.t=t; return {...this.x};}
+    const dt=Math.max(1e-3,(t-this.t)/1000); this.t=t;
+    const dxRaw={x:(p.x-this.x.x)/dt, y:(p.y-this.x.y)/dt, z:(p.z-this.x.z)/dt};
+    const aD=this.alpha(this.dCutoff,dt);
+    this.dx={x:aD*dxRaw.x+(1-aD)*this.dx.x, y:aD*dxRaw.y+(1-aD)*this.dx.y, z:aD*dxRaw.z+(1-aD)*this.dx.z};
+    const speed=V.len(this.dx);
+    const cutoff=this.minCutoff+this.beta*speed;
+    const a=this.alpha(cutoff,dt);
+    this.x={x:a*p.x+(1-a)*this.x.x, y:a*p.y+(1-a)*this.x.y, z:a*p.z+(1-a)*this.x.z};
+    return {...this.x};
+  }
+  reset(){this.x=null; this.dx={x:0,y:0,z:0}; this.t=null;}
+}
+class OneEuro1D {
+  constructor(minCutoff=1.0, beta=0.01){ this.f=new OneEuro3D(minCutoff,beta); }
+  filter(v,t){ return this.f.filter({x:v,y:0,z:0},t).x; }
+  reset(){ this.f.reset(); }
+}
+
+const filters = {
+  shoulder:new OneEuro3D(), elbow:new OneEuro3D(), wrist:new OneEuro3D(), otherShoulder:new OneEuro3D(),
+  shScreen:new OneEuro3D(0.7,0.004), elScreen:new OneEuro3D(0.7,0.004), wrScreen:new OneEuro3D(0.7,0.004),
+  handWr:new OneEuro3D(), handIdx:new OneEuro3D(), handPky:new OneEuro3D(),
+  rollSmooth:new OneEuro1D(0.8,0.006), yawSmooth:new OneEuro1D(0.8,0.006)
+};
+const handScreenFilters = Array.from({length:21}, ()=>new OneEuro3D(0.7,0.004));
+function resetAllFilters(){
+  for(const k in filters) filters[k].reset();
+  handScreenFilters.forEach(f=>f.reset());
+}
+
+// ════════════════════════════════════════════════════════
+// DOM
+// ════════════════════════════════════════════════════════
+const $cam=document.getElementById("cam");
+const $overlay=document.getElementById("overlay");
+const $view3d=document.getElementById("view3d");
+const $hud=document.getElementById("hud");
+const $status=document.getElementById("status");
+const $stage=document.getElementById("stage");
+const $btnStart=document.getElementById("btnStart");
+const $btnFlip=document.getElementById("btnFlip");
+const $btnArm=document.getElementById("btnArm");
+const $btnMirror=document.getElementById("btnMirror");
+const $btnQuality=document.getElementById("btnQuality");
+const $btnRobot=document.getElementById("btnRobot");
+const ctx=$overlay.getContext("2d");
+const ctx3d=$view3d.getContext("2d");
+
+// ════════════════════════════════════════════════════════
+// 워커
+// ════════════════════════════════════════════════════════
+let poseWorker=null, handWorker=null;
+let poseReady=false, handReady=false, poseBusy=false, handBusy=false;
+let lastPose=null, lastHands=null, poseMs=0, handMs=0;
+let poseDelegate="?", handDelegate="?";
+
+function makeWorker(){
+  const src=document.getElementById("workerSrc").textContent;
+  const blob=new Blob([src],{type:"application/javascript"});
+  return new Worker(URL.createObjectURL(blob));
+}
+function spawnWorkers(){
+  if(poseWorker) poseWorker.terminate();
+  if(handWorker) handWorker.terminate();
+  poseReady=handReady=poseBusy=handBusy=false;
+  lastPose=lastHands=null;
+
+  poseWorker=makeWorker(); handWorker=makeWorker();
+  poseWorker.onmessage=onWorkerMessage("pose");
+  handWorker.onmessage=onWorkerMessage("hand");
+
+  poseWorker.postMessage({type:"init",kind:"pose",bundleUrl:BUNDLE_URL,wasmRoot:WASM_ROOT,
+    modelUrl:POSE_MODELS[quality],opts:CONF});
+  handWorker.postMessage({type:"init",kind:"hand",bundleUrl:BUNDLE_URL,wasmRoot:WASM_ROOT,
+    modelUrl:HAND_MODEL,opts:CONF});
+}
+function onWorkerMessage(label){
+  return (e)=>{
+    const d=e.data;
+    if(d.type==="ready"){
+      if(label==="pose"){poseReady=true; poseDelegate=d.delegate;}
+      else {handReady=true; handDelegate=d.delegate;}
+      checkReady();
+    } else if(d.type==="result"){
+      if(d.kind==="pose"){lastPose=d.result; poseMs=d.ms; poseBusy=false;}
+      else {lastHands=d.result; handMs=d.ms; handBusy=false;}
+    } else if(d.type==="error"){
+      $status.style.opacity=1;
+      $status.textContent=`${d.kind} worker 오류: ${d.message}`;
+      console.error(d);
+    }
+  };
+}
+function checkReady(){
+  if(poseReady&&handReady){
+    $status.textContent=`준비 완료 (pose:${poseDelegate} / hand:${handDelegate}) — ▶ 시작`;
+    if(running){ $status.style.opacity=0; }
+    else setTimeout(()=>{$status.style.opacity=0.5;},1400);
+  }
+}
+spawnWorkers();
+
+// ════════════════════════════════════════════════════════
+// 카메라
+// ════════════════════════════════════════════════════════
+let stream=null, facing="user", running=false;
+
+async function startCamera(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:facing, width:{ideal:1280}, height:{ideal:720} },
+      audio:false
+    });
+    $cam.srcObject=stream;
+    applyMirror();
+    await $cam.play();
+    if(!$cam.videoWidth){
+      await new Promise(res=>{ $cam.onloadedmetadata=res; setTimeout(res,1000); });
+    }
+    resizeCanvases();
+    resetAllFilters();
+    $hud.hidden=false;
+    $status.style.opacity=0;
+    running=true;
+    requestAnimationFrame(loop);
+  }catch(err){
+    $status.style.opacity=1;
+    $status.textContent="카메라 실패: "+err.message;
+  }
+}
+function applyMirror(){
+  // 전면(user)일 때만 반전 의미 있음. 사용자 토글과 합쳐서 결정
+  const shouldMirror = mirrorOn && facing==="user";
+  $stage.classList.toggle("mirror", shouldMirror);
+}
+function resizeCanvases(){
+  const rect=$overlay.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  $overlay.width=Math.round(rect.width*dpr);
+  $overlay.height=Math.round(rect.height*dpr);
+}
+function normToCanvas(nx,ny){
+  const cw=$overlay.width, ch=$overlay.height;
+  const vw=$cam.videoWidth||1280, vh=$cam.videoHeight||720;
+  if(!vw||!vh) return {x:nx*cw,y:ny*ch};
+  const scale=Math.max(cw/vw,ch/vh);
+  const dispW=vw*scale, dispH=vh*scale;
+  return { x:(cw-dispW)/2 + nx*dispW, y:(ch-dispH)/2 + ny*dispH };
+}
+
+// ════════════════════════════════════════════════════════
+// 데이터 추출
+// ════════════════════════════════════════════════════════
+function extractArm(pose, arm, t){
+  if(!pose||!pose.worldLandmarks||pose.worldLandmarks.length===0) return null;
+  const wl=pose.worldLandmarks[0], sl=pose.landmarks[0];
+  if(!wl||!sl) return null;
+
+  const R=arm==="right";
+  const shW=wl[R?POSE_IDX.RSh:POSE_IDX.LSh];
+  const elW=wl[R?POSE_IDX.RElb:POSE_IDX.LElb];
+  const wrW=wl[R?POSE_IDX.RWr:POSE_IDX.LWr];
+  const oshW=wl[R?POSE_IDX.LSh:POSE_IDX.RSh];
+  const shS=sl[R?POSE_IDX.RSh:POSE_IDX.LSh];
+  const elS=sl[R?POSE_IDX.RElb:POSE_IDX.LElb];
+  const wrS=sl[R?POSE_IDX.RWr:POSE_IDX.LWr];
+
+  const sh=filters.shoulder.filter(shW,t);
+  const el=filters.elbow.filter(elW,t);
+  const wr=filters.wrist.filter(wrW,t);
+  const osh=filters.otherShoulder.filter(oshW,t);
+
+  const shScreen=filters.shScreen.filter({x:shS.x,y:shS.y,z:0},t);
+  const elScreen=filters.elScreen.filter({x:elS.x,y:elS.y,z:0},t);
+  const wrScreen=filters.wrScreen.filter({x:wrS.x,y:wrS.y,z:0},t);
+
+  const upper=V.sub(el,sh);
+  const fore=V.sub(wr,el);
+  const shLine=V.sub(osh,sh);
+
+  const elbowAngle=V.angle(V.scale(upper,-1),fore);
+  const shoulderAbduction=V.angle(upper,{x:0,y:1,z:0});
+  const yawRaw=Math.atan2(shLine.z,shLine.x)*180/Math.PI;
+  const yawDeg=filters.yawSmooth.filter(yawRaw,t);
+
+  return { sh,el,wr,osh, upper,fore,shLine,
+           elbowAngle,shoulderAbduction,yawDeg,
+           screen:{sh:shScreen,el:elScreen,wr:wrScreen} };
+}
+
+function extractHand(hands, arm, t, armWristNorm){
+  if(!hands||!hands.worldLandmarks||hands.worldLandmarks.length===0) return null;
+  const nHands=hands.worldLandmarks.length;
+
+  let pickIdx=0;
+
+  if(nHands===1){
+    // 손 하나면 그냥 그거
+    pickIdx=0;
+  } else {
+    // 손이 여러 개 → 추적 중인 팔의 손목(화면 정규좌표)과 가장 가까운 손 선택
+    // armWristNorm: {x,y} (0~1 정규화 화면좌표), extractArm의 손목 스크린값
+    if(armWristNorm){
+      let best=1e9;
+      for(let i=0;i<nHands;i++){
+        const sc=hands.landmarks[i];
+        if(!sc) continue;
+        const hw=sc[HAND_IDX.Wr];  // 손 손목 (정규좌표)
+        const dx=hw.x-armWristNorm.x, dy=hw.y-armWristNorm.y;
+        const d=dx*dx+dy*dy;
+        if(d<best){ best=d; pickIdx=i; }
+      }
+      // 손목은 팔에 고정되므로 위치는 안 튐. 거리는 '어느 손인지' 고르는 용도만.
+      // 임계값 넉넉하게 (0.12) — 올바른 손을 놓치지 않게
+      if(best>0.12){
+        filters.handWr.reset(); filters.handIdx.reset(); filters.handPky.reset();
+        handScreenFilters.forEach(f=>f.reset());
+        return null;
+      }
+    } else {
+      // 팔 손목 정보 없으면 라벨로 폴백
+      const wantSide=(arm==="right")?"Left":"Right";
+      for(let i=0;i<nHands;i++){
+        const hd=hands.handedness[i];
+        const label=(Array.isArray(hd)?hd[0]?.categoryName:hd?.categoryName)||"";
+        if(label===wantSide){pickIdx=i; break;}
+      }
+    }
+  }
+
+  const hlWorld=hands.worldLandmarks[pickIdx];
+  const hlScreen=hands.landmarks[pickIdx];
+  if(!hlWorld||!hlScreen) return null;
+
+  const wr=filters.handWr.filter(hlWorld[HAND_IDX.Wr],t);
+  const idx=filters.handIdx.filter(hlWorld[HAND_IDX.IndexMcp],t);
+  const pky=filters.handPky.filter(hlWorld[HAND_IDX.PinkyMcp],t);
+
+  const v1=V.sub(idx,wr), v2=V.sub(pky,wr);
+  const cross=(arm==="right")?V.cross(v1,v2):V.cross(v2,v1);
+  const normal=V.norm(cross);
+  const palmDir=V.norm(V.add(V.sub(idx,wr),V.sub(pky,wr)));
+
+  const screen=hlScreen.map((p,i)=>{
+    const f=handScreenFilters[i].filter({x:p.x,y:p.y,z:0},t);
+    return {x:f.x,y:f.y};
+  });
+
+  // 팔 손목에 고정된 화면좌표: 손 손목(screen[0]) 기준 상대좌표를
+  // 팔 손목(armWristNorm) 위치로 평행이동 → 손목이 항상 팔 벡터 끝에 붙음
+  let anchored=screen;
+  if(armWristNorm){
+    const hWrScreen=screen[HAND_IDX.Wr];
+    const dx=armWristNorm.x-hWrScreen.x;
+    const dy=armWristNorm.y-hWrScreen.y;
+    anchored=screen.map(p=>({x:p.x+dx, y:p.y+dy}));
+  }
+
+  return { wr,idx,pky,normal,palmDir, worldLm:hlWorld, screen, anchored };
+}
+
+// ════════════════════════════════════════════════════════
+// 메인 루프
+// ════════════════════════════════════════════════════════
+let lastSendTs=0, frameClock=0;
+let fpsCount=0, fpsTime=performance.now(), fpsVal=0;
+
+function loop(ts){
+  if(!running) return;
+  if($cam.readyState>=2 && ts-lastSendTs>16){  // 최대 ~60fps 디스패치
+    frameClock+=1;
+    const stamp=frameClock;
+    if(poseReady&&!poseBusy){
+      poseBusy=true;
+      createImageBitmap($cam).then(bmp=>{
+        poseWorker.postMessage({type:"frame",bitmap:bmp,ts:stamp},[bmp]);
+      }).catch(()=>{poseBusy=false;});
+    }
+    if(handReady&&!handBusy){
+      handBusy=true;
+      createImageBitmap($cam).then(bmp=>{
+        handWorker.postMessage({type:"frame",bitmap:bmp,ts:stamp},[bmp]);
+      }).catch(()=>{handBusy=false;});
+    }
+    lastSendTs=ts;
+  }
+  render(ts);
+
+  fpsCount++;
+  if(ts-fpsTime>=500){ fpsVal=fpsCount*1000/(ts-fpsTime); fpsCount=0; fpsTime=ts; }
+  requestAnimationFrame(loop);
+}
+
+// ════════════════════════════════════════════════════════
+// 렌더링
+// ════════════════════════════════════════════════════════
+function render(ts){
+  ctx.clearRect(0,0,$overlay.width,$overlay.height);
+  const arm=extractArm(lastPose,currentArm,ts);
+  // 팔의 손목 화면좌표를 손 선택에 넘겨 → 끼어든 손 무시
+  const armWristNorm = arm ? { x:arm.screen.wr.x, y:arm.screen.wr.y } : null;
+  const hand=extractHand(lastHands,currentArm,ts,armWristNorm);
+
+  if(arm){
+    const sh=normToCanvas(arm.screen.sh.x,arm.screen.sh.y);
+    const el=normToCanvas(arm.screen.el.x,arm.screen.el.y);
+    const wr=normToCanvas(arm.screen.wr.x,arm.screen.wr.y);
+    const dpr=window.devicePixelRatio||1;
+
+    // 손가락 뼈대 (옅게) — 손목을 팔 벡터 끝에 고정해서 그림
+    if(hand){
+      const hp = hand.anchored || hand.screen;
+      ctx.strokeStyle="rgba(168,184,255,0.5)";
+      ctx.lineWidth=2*dpr;
+      ctx.lineCap="round";
+      for(const [a,b] of HAND_BONES){
+        const pa=normToCanvas(hp[a].x,hp[a].y);
+        const pb=normToCanvas(hp[b].x,hp[b].y);
+        ctx.beginPath(); ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y); ctx.stroke();
+      }
+      for(const p of hp){
+        const pp=normToCanvas(p.x,p.y);
+        ctx.fillStyle="rgba(168,184,255,0.85)";
+        ctx.beginPath(); ctx.arc(pp.x,pp.y,2.5*dpr,0,Math.PI*2); ctx.fill();
+      }
+    }
+
+    drawArrow(ctx, sh, el, "#ff9e57", 8*dpr);
+    drawArrow(ctx, el, wr, "#7be0a8", 8*dpr);
+    drawJoint(ctx, sh, dpr); drawJoint(ctx, el, dpr); drawJoint(ctx, wr, dpr);
+
+    let rollAngle=null;
+    if(hand){
+      const rawRoll=V.angle(hand.normal,V.norm(arm.fore));
+      rollAngle=filters.rollSmooth.filter(rawRoll,ts);
+    }
+
+    // ── 로봇 서보 매핑 + 전송 ──
+    const servos=mapToServos(arm, hand, rollAngle);
+    if(robotConnected) sendToRobot(servos);
+
+    const u=arm.upper, f=arm.fore;
+    $hud.innerHTML =
+      `<span class="c-upper">상완  (${fmt(u.x)}, ${fmt(u.y)}, ${fmt(u.z)})  ${V.len(u).toFixed(3)}m</span>\n`+
+      `<span class="c-fore">전완  (${fmt(f.x)}, ${fmt(f.y)}, ${fmt(f.z)})  ${V.len(f).toFixed(3)}m</span>\n`+
+      `<span class="dim">─────────────────────────</span>\n`+
+      `팔꿈치 굽힘   ${arm.elbowAngle.toFixed(1)}°\n`+
+      `어깨 외전     ${arm.shoulderAbduction.toFixed(1)}°\n`+
+      `<span class="c-yaw">몸통 yaw      ${arm.yawDeg.toFixed(1)}°</span>\n`+
+      (hand
+        ? `<span class="c-palm">손목 roll     ${rollAngle.toFixed(1)}°</span>\n`
+        : `<span class="c-palm dim">손목 roll     (손 미감지)</span>\n`)+
+      `<span class="dim">──── 서보 각도 ${robotConnected?'[전송중]':'[미연결]'} ────</span>\n`+
+      `<span class="c-srv">S0 베이스 ${servos[0].toFixed(0)}°  S1 숄더 ${servos[1].toFixed(0)}°</span>\n`+
+      `<span class="c-srv">S2 엘보우 ${servos[2].toFixed(0)}°  S3 roll ${servos[3].toFixed(0)}°</span>\n`+
+      `<span class="c-srv">S4 pitch ${servos[4].toFixed(0)}°  S5 그립 ${servos[5].toFixed(0)}°</span>\n`+
+      `<span class="dim">─────────────────────────</span>\n`+
+      `<span class="c-fps">화면 ${fpsVal.toFixed(0)} fps</span>\n`+
+      `<span class="c-perf">pose ${poseMs.toFixed(0)}ms(${poseDelegate}) · hand ${handMs.toFixed(0)}ms(${handDelegate})</span>`;
+
+    draw3DView(arm, hand);
+  } else {
+    $hud.innerHTML=`<span class="dim">사람이 안 보여 — 어깨~손목이 프레임에 다 들어오게</span>\n`+
+                   `<span class="c-fps">화면 ${fpsVal.toFixed(0)} fps</span>`;
+    ctx3d.clearRect(0,0,240,240);
+  }
+}
+
+function fmt(n){ return (n>=0?"+":"")+n.toFixed(3); }
+
+function drawArrow(ctx,p1,p2,color,w){
+  ctx.strokeStyle=color; ctx.fillStyle=color; ctx.lineWidth=w; ctx.lineCap="round";
+  ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.stroke();
+  const a=Math.atan2(p2.y-p1.y,p2.x-p1.x); const L=w*2.2;
+  ctx.beginPath(); ctx.moveTo(p2.x,p2.y);
+  ctx.lineTo(p2.x-L*Math.cos(a-0.4),p2.y-L*Math.sin(a-0.4));
+  ctx.lineTo(p2.x-L*Math.cos(a+0.4),p2.y-L*Math.sin(a+0.4));
+  ctx.closePath(); ctx.fill();
+}
+function drawJoint(ctx,p,dpr){
+  ctx.fillStyle="#fff"; ctx.strokeStyle="#000"; ctx.lineWidth=2*dpr;
+  ctx.beginPath(); ctx.arc(p.x,p.y,7*dpr,0,Math.PI*2); ctx.fill(); ctx.stroke();
+}
+
+// ════════════════════════════════════════════════════════
+// 3D 미니뷰 (자동 회전 + 손가락 포함)
+// ════════════════════════════════════════════════════════
+let viewAngle=0;
+function draw3DView(arm, hand){
+  const c=ctx3d; c.clearRect(0,0,240,240);
+  const cx=120, cy=120, scale=200;
+  viewAngle+=0.01;
+  const ca=Math.cos(viewAngle), sa=Math.sin(viewAngle);
+
+  const project=(p)=>{
+    const x=p.x-arm.sh.x, y=p.y-arm.sh.y, z=p.z-arm.sh.z;
+    const x2=x*ca+z*sa, z2=-x*sa+z*ca;
+    const depth=1+z2*0.45;
+    return {x:cx+x2*scale/depth, y:cy+y*scale/depth, depth};
+  };
+
+  // 바닥 그리드
+  c.strokeStyle="rgba(120,140,180,0.1)"; c.lineWidth=1;
+  for(let gx=-2;gx<=2;gx++){
+    const a=project({x:gx*0.15,y:0.0,z:-0.3}), b=project({x:gx*0.15,y:0.0,z:0.3});
+    c.beginPath(); c.moveTo(a.x,a.y); c.lineTo(b.x,b.y); c.stroke();
+  }
+  // 축
+  c.strokeStyle="rgba(140,160,200,0.2)"; c.lineWidth=1;
+  c.beginPath(); c.moveTo(12,cy); c.lineTo(228,cy); c.moveTo(cx,12); c.lineTo(cx,228); c.stroke();
+
+  const ps=project(arm.sh), po=project(arm.osh), pe=project(arm.el), pw=project(arm.wr);
+
+  // 어깨선
+  c.strokeStyle="#ff7eaa"; c.lineWidth=2.5;
+  c.beginPath(); c.moveTo(ps.x,ps.y); c.lineTo(po.x,po.y); c.stroke();
+  // 상완
+  c.strokeStyle="#ff9e57"; c.lineWidth=4.5;
+  c.beginPath(); c.moveTo(ps.x,ps.y); c.lineTo(pe.x,pe.y); c.stroke();
+  // 전완
+  c.strokeStyle="#7be0a8"; c.lineWidth=4.5;
+  c.beginPath(); c.moveTo(pe.x,pe.y); c.lineTo(pw.x,pw.y); c.stroke();
+
+  // 손 (worldLm을 손목 기준으로 평행이동해서 전완 끝 wr에 붙임)
+  if(hand && hand.worldLm){
+    const hWr=hand.worldLm[HAND_IDX.Wr];
+    const handPts=hand.worldLm.map(p=>project({
+      x:arm.wr.x+(p.x-hWr.x), y:arm.wr.y+(p.y-hWr.y), z:arm.wr.z+(p.z-hWr.z)
+    }));
+    c.strokeStyle="#a8b8ff"; c.lineWidth=1.8;
+    for(const [a,b] of HAND_BONES){
+      c.beginPath(); c.moveTo(handPts[a].x,handPts[a].y); c.lineTo(handPts[b].x,handPts[b].y); c.stroke();
+    }
+    // 손바닥 normal (노란 점선)
+    const NL=0.08;
+    const ne=project({x:arm.wr.x+hand.normal.x*NL, y:arm.wr.y+hand.normal.y*NL, z:arm.wr.z+hand.normal.z*NL});
+    c.strokeStyle="#ffd479"; c.lineWidth=2; c.setLineDash([4,3]);
+    c.beginPath(); c.moveTo(pw.x,pw.y); c.lineTo(ne.x,ne.y); c.stroke(); c.setLineDash([]);
+  }
+
+  // 관절 점
+  for(const p of [ps,pe,pw,po]){
+    c.fillStyle="#fff"; c.beginPath(); c.arc(p.x,p.y,4,0,Math.PI*2); c.fill();
+  }
+
+  c.fillStyle="rgba(207,224,240,0.55)"; c.font="10px ui-monospace,monospace";
+  c.fillText("3D · auto-rotate", 8, 230);
+}
+
+// ════════════════════════════════════════════════════════
+// 로봇 제어 — Web Serial + 사람팔 → 6서보 각도 매핑
+// ════════════════════════════════════════════════════════
+let serialPort=null, serialWriter=null, robotConnected=false;
+let lastRobotSend=0;
+const ROBOT_INTERVAL=50;  // ms, 1초 20회 전송 (서보가 따라올 수 있는 속도)
+
+// 각 서보의 출력 범위 (아두이노 SERVO_RANGE와 일치시킬 것)
+const SERVO_RANGE=[270,180,180,180,180,180];
+
+// 매핑 보정값 — 조립 후 실제 보고 튜닝하는 부분
+// invert: 방향 뒤집기, offset: 영점 보정, gain: 민감도
+const MAP_CFG=[
+  { invert:false, offset:135, gain:1.0 },  // 0 베이스
+  { invert:false, offset:0,   gain:1.0 },  // 1 숄더
+  { invert:true,  offset:180, gain:1.0 },  // 2 엘보우 (굽힘 반전)
+  { invert:false, offset:90,  gain:1.0 },  // 3 손목 roll
+  { invert:false, offset:90,  gain:1.0 },  // 4 손목 pitch
+  { invert:false, offset:0,   gain:1.0 },  // 5 그리퍼
+];
+
+function clamp(v,lo,hi){ return v<lo?lo:(v>hi?hi:v); }
+
+// 사람 팔 데이터 → 서보 6각도 배열
+function mapToServos(arm, hand, rollAngle){
+  const out=[135,90,90,90,90,60];  // 기본값(중앙)
+
+  // ── 서보0: 베이스 회전 ──
+  // 어깨 기준 손목의 수평 방위각 (좌우로 휘두르는 방향)
+  const reach=V.sub(arm.wr, arm.sh);
+  let baseAng=Math.atan2(reach.x, -reach.z)*180/Math.PI;  // -180~180
+  baseAng=baseAng+135;  // 중앙을 135로
+  out[0]=clamp(baseAng, 0, 270);
+
+  // ── 서보1: 숄더 pitch ──
+  // 어깨 외전각: 팔이 아래로 늘어뜨려지면 0, 수평이면 90, 위로 들면 180
+  out[1]=clamp(arm.shoulderAbduction, 0, 180);
+
+  // ── 서보2: 엘보우 ──
+  // elbowAngle: 180=쭉 폄, 30=많이 접음. 서보는 반대로 매핑(MAP_CFG에서 invert)
+  let elb=arm.elbowAngle;
+  out[2]=clamp(MAP_CFG[2].invert ? (180-elb) : elb, 0, 180);
+
+  // ── 서보3: 손목 roll ──
+  if(rollAngle!=null){
+    // rollAngle 0~180 → 그대로
+    out[3]=clamp(rollAngle, 0, 180);
+  }
+
+  // ── 서보4: 손목 pitch (손이 전완 대비 얼마나 꺾였나) ──
+  if(hand){
+    const wristPitch=V.angle(hand.palmDir, V.norm(arm.fore));
+    out[4]=clamp(wristPitch, 0, 180);
+  }
+
+  // ── 서보5: 그리퍼 (엄지끝-검지끝 거리) ──
+  if(hand && hand.worldLm){
+    const thumb=hand.worldLm[HAND_IDX.ThumbTip];
+    const index=hand.worldLm[HAND_IDX.IndexTip];
+    const pinchDist=V.len(V.sub(thumb,index));  // 미터
+    // 0.02m(붙음)~0.10m(벌림) → 0(닫힘)~180(열림)
+    const g=clamp((pinchDist-0.02)/(0.10-0.02), 0, 1);
+    out[5]=g*180;
+  }
+
+  return out;
+}
+
+async function connectRobot(){
+  if(!("serial" in navigator)){
+    setStatus("⚠ 이 브라우저는 Web Serial 미지원 — 크롬/엣지로 열어");
+    return;
+  }
+  try{
+    serialPort=await navigator.serial.requestPort();
+    await serialPort.open({ baudRate:115200 });
+    serialWriter=serialPort.writable.getWriter();
+    robotConnected=true;
+    $btnRobot.textContent="🤖 로봇 연결됨";
+    $btnRobot.classList.add("on");
+    setStatus("로봇 연결 완료 — 팔을 움직여봐");
+    setTimeout(()=>{$status.style.opacity=0;},1500);
+  }catch(err){
+    setStatus("로봇 연결 실패: "+err.message);
+  }
+}
+
+async function disconnectRobot(){
+  robotConnected=false;
+  try{
+    if(serialWriter){ serialWriter.releaseLock(); serialWriter=null; }
+    if(serialPort){ await serialPort.close(); serialPort=null; }
+  }catch(e){}
+  $btnRobot.textContent="🤖 로봇 연결";
+  $btnRobot.classList.remove("on");
+}
+
+async function sendToRobot(servos){
+  if(!robotConnected||!serialWriter) return;
+  const now=performance.now();
+  if(now-lastRobotSend<ROBOT_INTERVAL) return;
+  lastRobotSend=now;
+  // "a0,a1,a2,a3,a4,a5\n" (정수로 반올림)
+  const line=servos.map(a=>Math.round(a)).join(",")+"\n";
+  try{
+    await serialWriter.write(new TextEncoder().encode(line));
+  }catch(err){
+    setStatus("전송 끊김: "+err.message);
+    robotConnected=false;
+  }
+}
+
+function setStatus(msg){
+  $status.style.opacity=1;
+  $status.textContent=msg;
+}
+
+
+$btnStart.onclick=async()=>{ await startCamera(); $btnStart.disabled=true; };
+$btnFlip.onclick=async()=>{
+  facing=(facing==="user")?"environment":"user";
+  if(running) await startCamera(); else applyMirror();
+};
+$btnArm.onclick=()=>{
+  currentArm=(currentArm==="right")?"left":"right";
+  $btnArm.textContent="팔: "+(currentArm==="right"?"오른쪽":"왼쪽");
+  resetAllFilters();
+};
+$btnMirror.onclick=()=>{
+  mirrorOn=!mirrorOn;
+  $btnMirror.textContent="좌우반전: "+(mirrorOn?"켬":"끔");
+  $btnMirror.classList.toggle("on",mirrorOn);
+  applyMirror();
+};
+$btnQuality.onclick=()=>{
+  quality=(quality==="heavy")?"full":"heavy";
+  $btnQuality.textContent="모델: "+(quality==="heavy"?"Heavy":"Full");
+  $status.style.opacity=1;
+  $status.textContent="모델 교체 중… 다시 로딩";
+  spawnWorkers();
+};
+$btnRobot.onclick=async()=>{
+  if(robotConnected) await disconnectRobot();
+  else await connectRobot();
+};
+
+if(!window.isSecureContext){
+  $status.textContent=`⚠ 이 주소(${location.protocol})에선 카메라 API가 잠겨 있어. HTTPS 또는 localhost로 열어야 함.`;
+}
+let resizeTimer=null;
+window.addEventListener("resize",()=>{
+  if(!running) return;
+  clearTimeout(resizeTimer); resizeTimer=setTimeout(resizeCanvases,150);
+});
+</script>
+</body>
+</html>

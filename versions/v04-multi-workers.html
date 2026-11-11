@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Arm Vector — Multi v4 (Workers)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:system-ui,sans-serif; background:#0b0f14; color:#e8eef4;
+         height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
+  #stage { position:relative; flex:1; min-height:0; background:#000; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  video.mirror { transform:scaleX(-1); }
+  #hud { position:absolute; top:8px; left:8px; white-space:pre;
+         font:12px/1.6 ui-monospace,monospace;
+         background:rgba(0,0,0,.45); border-radius:10px; padding:6px 10px; pointer-events:none; }
+  #status { position:absolute; bottom:10px; left:0; right:0; text-align:center;
+            font-size:13px; color:#cfe0f0; text-shadow:0 1px 3px #000; padding:0 14px; }
+  #bar { display:flex; gap:6px; padding:10px;
+         padding-bottom:calc(10px + env(safe-area-inset-bottom)); background:#11161d; }
+  button { flex:1; padding:12px 0; font-size:13px; font-weight:600; color:#e8eef4;
+           background:#1d2632; border:1px solid #2c3947; border-radius:12px; }
+  button:active { background:#2a3645; }
+  button:disabled { opacity:.5; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+  <div id="hud" hidden></div>
+  <div id="status">▶ 시작을 누르면 카메라 권한을 물어봐</div>
+</div>
+<div id="bar">
+  <button id="btnStart">▶ 시작</button>
+  <button id="btnFlip">카메라</button>
+  <button id="btnHands">손가락 ON</button>
+  <button id="btnModel">정확도: 표준</button>
+</div>
+
+<script>
+// 자가 진단: 보안 컨텍스트가 아니면 카메라 API 자체가 잠긴다 (권한과 무관)
+window.addEventListener("load", function () {
+  var st = document.getElementById("status");
+  if (!window.isSecureContext) {
+    st.textContent = "⚠ 이 주소(" + location.protocol + ")에선 카메라 API가 잠겨 있어. localhost 서버로 열어줘.";
+  }
+});
+</script>
+
+<script type="text/js-worker" id="workerSrc">
+// ── 추론 전용 워커: 포즈 또는 손 한 가지를 맡는다 ──
+import { FilesetResolver, PoseLandmarker, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35";
+
+let lm = null;
+let kind = "";
+
+async function build(msg) {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm");
+  const make = delegate => kind === "pose"
+    ? PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: msg.model, delegate },
+        runningMode: "VIDEO",
+        numPoses: msg.num
+      })
+    : HandLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: msg.model, delegate },
+        runningMode: "VIDEO",
+        numHands: msg.num
+      });
+  try { lm = await make("GPU"); return "GPU"; }
+  catch (e) { lm = await make("CPU"); return "CPU"; }
+}
+
+self.onmessage = async e => {
+  const m = e.data;
+  try {
+    if (m.type === "init") {
+      kind = m.kind;
+      if (lm) { try { lm.close(); } catch (_) {} lm = null; }
+      const delegate = await build(m);
+      self.postMessage({ type: "ready", kind, delegate });
+    } else if (m.type === "frame") {
+      if (!lm) { m.bitmap.close(); self.postMessage({ type: "skip", kind }); return; }
+      const t0 = performance.now();
+      const res = lm.detectForVideo(m.bitmap, m.ts);
+      m.bitmap.close();
+      const ms = performance.now() - t0;
+      const data = kind === "pose"
+        ? (res.landmarks || []).map(p => p.map(l => ({ x: l.x, y: l.y, v: l.visibility })))
+        : (res.landmarks || []).map(h => h.map(l => ({ x: l.x, y: l.y })));
+      self.postMessage({ type: "result", kind, ms, data });
+    }
+  } catch (err) {
+    self.postMessage({ type: "error", kind, message: String((err && err.message) || err) });
+  }
+};
+</script>
+
+<script type="module">
+window.__armOK = true;
+
+const video = document.getElementById("cam");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const statusEl = document.getElementById("status");
+const setStatus = t => { statusEl.textContent = t; };
+
+// ── 설정 ──────────────────────────────────────────
+const MAX_PEOPLE = 4;
+const MAX_HANDS = 4;
+const MATCH_RATIO = 0.9;    // 손 매칭 허용 반경 = 어깨너비 × 이 값
+const MIN_CUTOFF = 1.5;     // One Euro: 정지 시 떨림 보이면 ↓
+const BETA = 0.012;         // One Euro: 빠른 움직임이 늦으면 ↑
+
+const POSE_MODELS = {
+  "표준": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+  "높음": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+};
+const HAND_MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+let poseQuality = "표준";
+
+const PALETTE = [
+  ["#ff9f43", "#ffd58a"],
+  ["#2ed5c4", "#a8f0ea"],
+  ["#ff6b81", "#ffc1cb"],
+  ["#a78bfa", "#d6c9ff"]
+];
+const SIDES = [
+  { sh: 12, el: 14, wr: 16, key: "R" },
+  { sh: 11, el: 13, wr: 15, key: "L" }
+];
+const PALM_LINKS = [[0,1],[0,5],[5,9],[9,13],[13,17],[0,17]];
+const FINGER_BONES = [
+  [1,2],[2,3],[3,4],
+  [5,6],[6,7],[7,8],
+  [9,10],[10,11],[11,12],
+  [13,14],[14,15],[15,16],
+  [17,18],[18,19],[19,20]
+];
+
+let stream = null, running = false, facing = "user", handsOn = true;
+let errMsg = "";
+let fpsR = 0, tPrevR = performance.now();
+const statPose = { ms: 0, delegate: "-" };
+const statHand = { ms: 0, delegate: "-" };
+
+// ── One Euro 필터 ─────────────────────────────────
+function lpAlpha(cutoff, dt) {
+  const tau = 1 / (2 * Math.PI * cutoff);
+  return 1 / (1 + tau / dt);
+}
+class OneEuro {
+  constructor() { this.x = null; this.dx = 0; this.prev = null; }
+  filter(v, dt) {
+    if (this.prev === null) { this.prev = v; this.x = v; return v; }
+    const rawDx = (v - this.prev) / dt;
+    this.prev = v;
+    const aD = lpAlpha(1.0, dt);
+    this.dx = aD * rawDx + (1 - aD) * this.dx;
+    const cutoff = MIN_CUTOFF + BETA * Math.abs(this.dx);
+    const a = lpAlpha(cutoff, dt);
+    this.x = a * v + (1 - a) * this.x;
+    return this.x;
+  }
+}
+class PointsSmoother {
+  constructor(snapDist) { this.snap = snapDist; this.f = null; this.lastT = null; this.root = null; }
+  apply(raw, tSec) {
+    const jump = this.root &&
+      Math.hypot(raw[0].x - this.root.x, raw[0].y - this.root.y) > this.snap;
+    if (!this.f || this.f.length !== raw.length || jump) {
+      this.f = raw.map(() => [new OneEuro(), new OneEuro()]);
+      this.lastT = null;
+    }
+    let dt = this.lastT === null ? 1 / 30 : tSec - this.lastT;
+    if (!(dt > 1e-4)) dt = 1 / 30;
+    if (dt > 0.2) dt = 0.2;
+    this.lastT = tSec;
+    this.root = { x: raw[0].x, y: raw[0].y };
+    return raw.map((p, i) => ({
+      x: this.f[i][0].filter(p.x, dt),
+      y: this.f[i][1].filter(p.y, dt)
+    }));
+  }
+}
+const poseSm = new Map(), handSm = new Map();
+
+// ── 워커 (포즈/손 병렬) ────────────────────────────
+let poseW = null, handW = null;
+let poseReady = false, handReady = false;
+let poseBusy = false, handBusy = false;
+
+// 최신 결과 — 렌더 루프는 이것만 그린다
+let poseItems = [];   // [{ pts, visArr }]
+let wristPool = [];   // [{ x, y, pi, side, th }]
+let handItems = [];   // [{ pts, wp }]
+let personCount = 0;
+
+const PX = nx => (facing === "user" ? 1 - nx : nx) * canvas.width;
+const PY = ny => ny * canvas.height;
+
+function spawn() {
+  const src = document.getElementById("workerSrc").textContent;
+  const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+  return new Worker(url, { type: "module" });
+}
+
+function onPoseResult(m) {
+  poseBusy = false;
+  statPose.ms = statPose.ms * 0.8 + m.ms * 0.2;
+  const tSec = performance.now() / 1000;
+
+  const persons = m.data
+    .map(lms => ({ lms, cx: (lms[11].x + lms[12].x) / 2 }))
+    .sort((a, b) => (facing === "user" ? b.cx - a.cx : a.cx - b.cx));
+  personCount = persons.length;
+
+  const items = [], pool = [];
+  persons.forEach((p, i) => {
+    const visArr = p.lms.map(l => (l.v === undefined ? 1 : l.v));
+    let sm = poseSm.get(i);
+    if (!sm) { sm = new PointsSmoother(canvas.width * 0.15); poseSm.set(i, sm); }
+    const pts = sm.apply(p.lms.map(l => ({ x: PX(l.x), y: PY(l.y) })), tSec);
+    const shoulderW = Math.hypot(pts[12].x - pts[11].x, pts[12].y - pts[11].y);
+    const th = Math.max(shoulderW * MATCH_RATIO, canvas.height * 0.10);
+    for (const s of SIDES) {
+      if (Math.min(visArr[s.sh], visArr[s.el], visArr[s.wr]) < 0.5) continue;
+      pool.push({ x: pts[s.wr].x, y: pts[s.wr].y, pi: i, side: s.key, th });
+    }
+    items.push({ pts, visArr });
+  });
+  poseItems = items;
+  wristPool = pool;
+}
+
+function onHandResult(m) {
+  handBusy = false;
+  statHand.ms = statHand.ms * 0.8 + m.ms * 0.2;
+  const tSec = performance.now() / 1000;
+  const rawHands = m.data.map(h => h.map(l => ({ x: PX(l.x), y: PY(l.y) })));
+
+  // 1:1 그리디 매칭 (어깨너비 비례 반경)
+  const pairsList = [];
+  rawHands.forEach((pts, hi) => {
+    for (const wp of wristPool) {
+      const d = Math.hypot(wp.x - pts[0].x, wp.y - pts[0].y);
+      if (d < wp.th) pairsList.push({ hi, wp, d });
+    }
+  });
+  pairsList.sort((a, b) => a.d - b.d);
+  const usedH = new Set(), usedW = new Set(), assign = new Map();
+  for (const pr of pairsList) {
+    const wid = pr.wp.pi + "-" + pr.wp.side;
+    if (usedH.has(pr.hi) || usedW.has(wid)) continue;
+    usedH.add(pr.hi); usedW.add(wid);
+    assign.set(pr.hi, pr.wp);
+  }
+  handItems = rawHands.map((raw, hi) => {
+    const wp = assign.get(hi) || null;
+    const key = wp ? "h" + wp.pi + "-" + wp.side : "free" + hi;
+    let sm = handSm.get(key);
+    if (!sm) { sm = new PointsSmoother(canvas.width * 0.12); handSm.set(key, sm); }
+    return { pts: sm.apply(raw, tSec), wp };
+  });
+}
+
+function initWorkers() {
+  if (poseW) return;
+  poseW = spawn(); handW = spawn();
+  const onMsg = e => {
+    const m = e.data;
+    if (m.type === "ready") {
+      if (m.kind === "pose") { poseReady = true; statPose.delegate = m.delegate; }
+      else { handReady = true; statHand.delegate = m.delegate; }
+    } else if (m.type === "result") {
+      if (m.kind === "pose") onPoseResult(m); else onHandResult(m);
+    } else if (m.type === "skip") {
+      if (m.kind === "pose") poseBusy = false; else handBusy = false;
+    } else if (m.type === "error") {
+      if (m.kind === "pose") poseBusy = false; else handBusy = false;
+      errMsg = "워커 오류(" + m.kind + "): " + m.message;
+    }
+  };
+  poseW.onmessage = onMsg;
+  handW.onmessage = onMsg;
+  poseW.onerror = ev => { errMsg = "포즈 워커 로드 실패 — 인터넷/CDN 확인" + (ev.message ? ": " + ev.message : ""); };
+  handW.onerror = ev => { errMsg = "손 워커 로드 실패 — 인터넷/CDN 확인" + (ev.message ? ": " + ev.message : ""); };
+  poseW.postMessage({ type: "init", kind: "pose", model: POSE_MODELS[poseQuality], num: MAX_PEOPLE });
+  handW.postMessage({ type: "init", kind: "hand", model: HAND_MODEL, num: MAX_HANDS });
+}
+
+// ── 프레임 공급 (백프레셔: 바쁘면 버리고 최신만) ──
+async function sendFrames() {
+  if (!running || video.readyState < 2) return;
+  if (poseReady && !poseBusy) {
+    poseBusy = true;
+    try {
+      const bmp = await createImageBitmap(video);
+      poseW.postMessage({ type: "frame", bitmap: bmp, ts: performance.now() }, [bmp]);
+    } catch (_) { poseBusy = false; }
+  }
+  if (handsOn && handReady && !handBusy) {
+    handBusy = true;
+    try {
+      const bmp = await createImageBitmap(video);
+      handW.postMessage({ type: "frame", bitmap: bmp, ts: performance.now() }, [bmp]);
+    } catch (_) { handBusy = false; }
+  }
+}
+function pumpRVFC() { if (!running) return; sendFrames(); video.requestVideoFrameCallback(pumpRVFC); }
+function pumpRAF()  { if (!running) return; sendFrames(); requestAnimationFrame(pumpRAF); }
+function startPump() {
+  if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) video.requestVideoFrameCallback(pumpRVFC);
+  else requestAnimationFrame(pumpRAF);
+}
+
+// ── 그리기 ────────────────────────────────────────
+function arrow(a, b, color, width, head) {
+  const ang = Math.atan2(b.y - a.y, b.x - a.x);
+  ctx.strokeStyle = color; ctx.fillStyle = color;
+  ctx.lineWidth = width; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(b.x, b.y);
+  ctx.lineTo(b.x - head * Math.cos(ang - 0.45), b.y - head * Math.sin(ang - 0.45));
+  ctx.lineTo(b.x - head * Math.cos(ang + 0.45), b.y - head * Math.sin(ang + 0.45));
+  ctx.closePath(); ctx.fill();
+}
+function joint(p, r) {
+  ctx.fillStyle = "#fff"; ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+}
+function label(text, x, y, color) {
+  ctx.font = "bold 14px ui-monospace, monospace";
+  ctx.strokeStyle = "rgba(0,0,0,.85)"; ctx.lineWidth = 3;
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+function angleDeg(v1, v2) {
+  const dot = v1.x * v2.x + v1.y * v2.y;
+  const n = Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y) + 1e-9;
+  return Math.acos(Math.min(1, Math.max(-1, dot / n))) * 180 / Math.PI;
+}
+
+// ── 렌더 루프 (추론과 독립적으로 항상 부드럽게) ──
+function render() {
+  if (!running) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const now = performance.now();
+  fpsR = fpsR * 0.9 + (1000 / (now - tPrevR)) * 0.1;
+  tPrevR = now;
+
+  poseItems.forEach((it, i) => {
+    const col = PALETTE[i % PALETTE.length];
+    const pts = it.pts, visArr = it.visArr;
+    const shL = pts[11], shR = pts[12];
+    if (visArr[11] > 0.5 && visArr[12] > 0.5) {
+      ctx.strokeStyle = col[0]; ctx.lineWidth = 3;
+      ctx.setLineDash([9, 7]);
+      ctx.beginPath(); ctx.moveTo(shL.x, shL.y); ctx.lineTo(shR.x, shR.y); ctx.stroke();
+      ctx.setLineDash([]);
+      label("P" + (i + 1), (shL.x + shR.x) / 2 - 10, (shL.y + shR.y) / 2 - 12, col[0]);
+    }
+    for (const s of SIDES) {
+      if (Math.min(visArr[s.sh], visArr[s.el], visArr[s.wr]) < 0.5) continue;
+      const sh = pts[s.sh], el = pts[s.el], wr = pts[s.wr];
+      const upper = { x: el.x - sh.x, y: el.y - sh.y };
+      const fore  = { x: wr.x - el.x, y: wr.y - el.y };
+      const elbow = angleDeg({ x: -upper.x, y: -upper.y }, fore);
+      arrow(sh, el, col[0], 5, 13);
+      arrow(el, wr, col[1], 5, 13);
+      joint(sh, 6); joint(el, 6); joint(wr, 6);
+      label(elbow.toFixed(0) + "\u00b0", el.x + 10, el.y + 5, col[0]);
+    }
+  });
+
+  if (handsOn) {
+    for (const h of handItems) {
+      const col = h.wp ? PALETTE[h.wp.pi % PALETTE.length][1] : "#9fb3c8";
+      const pts = h.pts;
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
+      for (const [a, b] of PALM_LINKS) {
+        ctx.beginPath(); ctx.moveTo(pts[a].x, pts[a].y); ctx.lineTo(pts[b].x, pts[b].y); ctx.stroke();
+      }
+      for (const [a, b] of FINGER_BONES) arrow(pts[a], pts[b], col, 3, 7);
+      for (let k = 1; k < 21; k++) joint(pts[k], 2.5);
+      joint(pts[0], 4);
+      const name = h.wp ? "P" + (h.wp.pi + 1) + (h.wp.side === "R" ? " 오른손" : " 왼손") : "손";
+      label(name, pts[0].x + 8, pts[0].y - 10, col);
+    }
+  }
+
+  hud.hidden = false;
+  hud.textContent =
+    "인원 " + personCount + "명 · 손 " + (handsOn ? handItems.length : 0) + "개 · 렌더 " + fpsR.toFixed(0) + "fps\n" +
+    "포즈 " + statPose.ms.toFixed(0) + "ms(" + statPose.delegate + ") · 손 " +
+    statHand.ms.toFixed(0) + "ms(" + statHand.delegate + ")";
+
+  if (errMsg) setStatus(errMsg);
+  else if (poseReady) setStatus(personCount === 0 ? "사람이 안 보여" : "");
+  requestAnimationFrame(render);
+}
+
+// ── 카메라 ────────────────────────────────────────
+async function startCam() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  video.classList.toggle("mirror", facing === "user");
+  await new Promise(r => {
+    if (video.readyState >= 1) return r();
+    video.onloadedmetadata = () => r();
+  });
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+}
+
+function camErrMsg(err) {
+  if (err && (err.name === "NotAllowedError" || err.name === "SecurityError"))
+    return "카메라가 막혀 있어. localhost 서버로 열어줘.";
+  if (err && err.name === "NotFoundError") return "카메라를 못 찾았어.";
+  return "에러: " + (err && err.message ? err.message : err);
+}
+
+// ── 버튼 ──────────────────────────────────────────
+document.getElementById("btnStart").onclick = async e => {
+  const btn = e.currentTarget;
+  if (running) { running = false; btn.textContent = "▶ 시작"; setStatus("정지됨"); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("카메라 API가 잠겨 있어 (" + location.protocol + "). localhost로 열어야 해.");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    errMsg = "";
+    setStatus("카메라 여는 중...");
+    await startCam();
+    initWorkers();
+    if (!poseReady) setStatus("모델 로딩 중... (첫 실행만 몇 초 걸려)");
+    try { await navigator.wakeLock.request("screen"); } catch (_) {}
+    running = true;
+    btn.textContent = "⏸ 정지";
+    startPump();
+    requestAnimationFrame(render);
+  } catch (err) {
+    setStatus(camErrMsg(err));
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+document.getElementById("btnFlip").onclick = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  poseSm.clear(); handSm.clear();
+  if (stream) {
+    try { await startCam(); }
+    catch (err) { setStatus(camErrMsg(err)); }
+  }
+};
+
+document.getElementById("btnHands").onclick = e => {
+  handsOn = !handsOn;
+  if (!handsOn) handItems = [];
+  e.currentTarget.textContent = "손가락 " + (handsOn ? "ON" : "OFF");
+};
+
+document.getElementById("btnModel").onclick = e => {
+  poseQuality = poseQuality === "표준" ? "높음" : "표준";
+  e.currentTarget.textContent = "정확도: " + poseQuality;
+  if (poseW) {
+    poseReady = false; poseBusy = false;
+    setStatus("포즈 모델 교체 중...");
+    poseW.postMessage({ type: "init", kind: "pose", model: POSE_MODELS[poseQuality], num: MAX_PEOPLE });
+  }
+};
+</script>
+</body>
+</html>

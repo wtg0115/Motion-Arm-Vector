@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Arm Vector — Multi v3</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:system-ui,sans-serif; background:#0b0f14; color:#e8eef4;
+         height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
+  #stage { position:relative; flex:1; min-height:0; background:#000; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  video.mirror { transform:scaleX(-1); }
+  #hud { position:absolute; top:8px; left:8px;
+         font:12px/1.6 ui-monospace,monospace;
+         background:rgba(0,0,0,.45); border-radius:10px; padding:6px 10px; pointer-events:none; }
+  #status { position:absolute; bottom:10px; left:0; right:0; text-align:center;
+            font-size:13px; color:#cfe0f0; text-shadow:0 1px 3px #000; padding:0 14px; }
+  #bar { display:flex; gap:8px; padding:10px;
+         padding-bottom:calc(10px + env(safe-area-inset-bottom)); background:#11161d; }
+  button { flex:1; padding:13px 0; font-size:14px; font-weight:600; color:#e8eef4;
+           background:#1d2632; border:1px solid #2c3947; border-radius:12px; }
+  button:active { background:#2a3645; }
+  button:disabled { opacity:.5; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+  <div id="hud" hidden></div>
+  <div id="status">▶ 시작을 누르면 카메라 권한을 물어봐</div>
+</div>
+<div id="bar">
+  <button id="btnStart">▶ 시작</button>
+  <button id="btnFlip">카메라 전환</button>
+  <button id="btnHands">손가락: ON</button>
+</div>
+
+<script>
+// 자가 진단: 보안 컨텍스트가 아니면 카메라 API 자체가 잠긴다 (권한과 무관)
+window.addEventListener("load", function () {
+  var st = document.getElementById("status");
+  if (!window.isSecureContext) {
+    st.textContent = "⚠ 이 주소(" + location.protocol + ")에선 카메라 API가 잠겨 있어. localhost 서버나 file://로 열어줘.";
+  }
+  setTimeout(function () {
+    if (!window.__armOK) {
+      st.textContent = "⚠ 스크립트 로드 실패 — 인터넷 연결(CDN 접속)을 확인해줘.";
+    }
+  }, 3500);
+});
+</script>
+<script type="module">
+import { FilesetResolver, PoseLandmarker, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+window.__armOK = true;
+
+const video = document.getElementById("cam");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const statusEl = document.getElementById("status");
+const setStatus = t => { statusEl.textContent = t; };
+
+// ── 설정 ──────────────────────────────────────────
+const MAX_PEOPLE = 4;
+const MAX_HANDS = 4;
+const MATCH_RATIO = 0.9;    // 손 매칭 허용 반경 = 어깨너비 × 이 값
+// One Euro 필터: 멈추면 강하게 스무딩, 빨리 움직이면 즉각 추종
+const MIN_CUTOFF = 1.5;     // Hz. 정지 시 떨림이 보이면 ↓ (예: 1.0)
+const BETA = 0.012;         // 빠른 움직임이 아직 늦게 느껴지면 ↑ (예: 0.02)
+
+// 사람별 색: [상완·몸통(진함), 전완·손(연함)]
+const PALETTE = [
+  ["#ff9f43", "#ffd58a"],
+  ["#2ed5c4", "#a8f0ea"],
+  ["#ff6b81", "#ffc1cb"],
+  ["#a78bfa", "#d6c9ff"]
+];
+const SIDES = [
+  { sh: 12, el: 14, wr: 16, key: "R" },
+  { sh: 11, el: 13, wr: 15, key: "L" }
+];
+// 손 골격: 손바닥(선) + 손가락 마디(벡터)
+const PALM_LINKS = [[0,1],[0,5],[5,9],[9,13],[13,17],[0,17]];
+const FINGER_BONES = [
+  [1,2],[2,3],[3,4],
+  [5,6],[6,7],[7,8],
+  [9,10],[10,11],[11,12],
+  [13,14],[14,15],[15,16],
+  [17,18],[18,19],[19,20]
+];
+
+let poseLm = null, handLm = null, stream = null, running = false;
+let facing = "user", handsOn = true, lastVideoTime = -1;
+let fps = 0, tPrev = performance.now();
+
+// ── One Euro 필터 (속도 적응형 스무딩) ─────────────
+function lpAlpha(cutoff, dt) {
+  const tau = 1 / (2 * Math.PI * cutoff);
+  return 1 / (1 + tau / dt);
+}
+class OneEuro {
+  constructor() { this.x = null; this.dx = 0; this.prev = null; }
+  filter(v, dt) {
+    if (this.prev === null) { this.prev = v; this.x = v; return v; }
+    const rawDx = (v - this.prev) / dt;
+    this.prev = v;
+    const aD = lpAlpha(1.0, dt);
+    this.dx = aD * rawDx + (1 - aD) * this.dx;
+    const cutoff = MIN_CUTOFF + BETA * Math.abs(this.dx);  // 빠를수록 컷오프↑ = 지연↓
+    const a = lpAlpha(cutoff, dt);
+    this.x = a * v + (1 - a) * this.x;
+    return this.x;
+  }
+}
+// 랜드마크 배열 단위 스무딩 + 정체성 점프 감지 시 스냅
+class PointsSmoother {
+  constructor(snapDist) { this.snap = snapDist; this.f = null; this.lastT = null; this.root = null; }
+  apply(raw, tSec) {
+    const jump = this.root &&
+      Math.hypot(raw[0].x - this.root.x, raw[0].y - this.root.y) > this.snap;
+    if (!this.f || this.f.length !== raw.length || jump) {
+      this.f = raw.map(() => [new OneEuro(), new OneEuro()]);
+      this.lastT = null;
+    }
+    let dt = this.lastT === null ? 1 / 30 : tSec - this.lastT;
+    if (!(dt > 1e-4)) dt = 1 / 30;
+    if (dt > 0.2) dt = 0.2;
+    this.lastT = tSec;
+    this.root = { x: raw[0].x, y: raw[0].y };
+    return raw.map((p, i) => ({
+      x: this.f[i][0].filter(p.x, dt),
+      y: this.f[i][1].filter(p.y, dt)
+    }));
+  }
+}
+const poseSm = new Map();   // 사람 슬롯별
+const handSm = new Map();   // 손 키별
+
+async function loadModels(delegate) {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const pose = await PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate
+    },
+    runningMode: "VIDEO",
+    numPoses: MAX_PEOPLE
+  });
+  const hand = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate
+    },
+    runningMode: "VIDEO",
+    numHands: MAX_HANDS
+  });
+  return { pose, hand };
+}
+
+async function startCam() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  video.classList.toggle("mirror", facing === "user");
+  await new Promise(r => {
+    if (video.readyState >= 1) return r();
+    video.onloadedmetadata = () => r();
+  });
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+}
+
+// ── 그리기 ────────────────────────────────────────
+const X = l => (facing === "user" ? 1 - l.x : l.x) * canvas.width;
+const Y = l => l.y * canvas.height;
+const vis = l => (l.visibility === undefined ? 1 : l.visibility);
+
+function arrow(a, b, color, width, head) {
+  const ang = Math.atan2(b.y - a.y, b.x - a.x);
+  ctx.strokeStyle = color; ctx.fillStyle = color;
+  ctx.lineWidth = width; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(b.x, b.y);
+  ctx.lineTo(b.x - head * Math.cos(ang - 0.45), b.y - head * Math.sin(ang - 0.45));
+  ctx.lineTo(b.x - head * Math.cos(ang + 0.45), b.y - head * Math.sin(ang + 0.45));
+  ctx.closePath(); ctx.fill();
+}
+
+function joint(p, r) {
+  ctx.fillStyle = "#fff"; ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+}
+
+function label(text, x, y, color) {
+  ctx.font = "bold 14px ui-monospace, monospace";
+  ctx.strokeStyle = "rgba(0,0,0,.85)"; ctx.lineWidth = 3;
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+
+function angleDeg(v1, v2) {
+  const dot = v1.x * v2.x + v1.y * v2.y;
+  const n = Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y) + 1e-9;
+  return Math.acos(Math.min(1, Math.max(-1, dot / n))) * 180 / Math.PI;
+}
+
+// ── 메인 루프 ─────────────────────────────────────
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const ts = performance.now();
+    const tSec = ts / 1000;
+    const poseRes = poseLm.detectForVideo(video, ts);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const now = performance.now();
+    fps = fps * 0.9 + (1000 / (now - tPrev)) * 0.1;
+    tPrev = now;
+
+    // 화면 왼쪽부터 P1 (프레임 간 번호 안정화)
+    const persons = (poseRes.landmarks || [])
+      .map(lms => ({ lms, cx: (lms[11].x + lms[12].x) / 2 }))
+      .sort((a, b) => (facing === "user" ? b.cx - a.cx : a.cx - b.cx));
+
+    const wristPool = [];   // 손 매칭 후보: {x, y, pi, side, th}
+
+    persons.forEach((p, i) => {
+      const col = PALETTE[i % PALETTE.length];
+      const visArr = p.lms.map(vis);
+      let sm = poseSm.get(i);
+      if (!sm) { sm = new PointsSmoother(canvas.width * 0.15); poseSm.set(i, sm); }
+      const pts = sm.apply(p.lms.map(l => ({ x: X(l), y: Y(l) })), tSec);
+
+      const shL = pts[11], shR = pts[12];
+      const shoulderW = Math.hypot(shR.x - shL.x, shR.y - shL.y);
+      // 사람별 매칭 허용 반경: 어깨너비 비례 (가까우면 크게, 멀면 작게)
+      const th = Math.max(shoulderW * MATCH_RATIO, canvas.height * 0.10);
+
+      // 몸통 어깨선 (점선) — 양팔을 한 사람으로 묶어주는 기준선
+      if (visArr[11] > 0.5 && visArr[12] > 0.5) {
+        ctx.strokeStyle = col[0]; ctx.lineWidth = 3;
+        ctx.setLineDash([9, 7]);
+        ctx.beginPath(); ctx.moveTo(shL.x, shL.y); ctx.lineTo(shR.x, shR.y); ctx.stroke();
+        ctx.setLineDash([]);
+        label("P" + (i + 1), (shL.x + shR.x) / 2 - 10, (shL.y + shR.y) / 2 - 12, col[0]);
+      }
+
+      for (const s of SIDES) {
+        if (Math.min(visArr[s.sh], visArr[s.el], visArr[s.wr]) < 0.5) continue;
+        const sh = pts[s.sh], el = pts[s.el], wr = pts[s.wr];
+        wristPool.push({ x: wr.x, y: wr.y, pi: i, side: s.key, th });
+
+        const upper = { x: el.x - sh.x, y: el.y - sh.y };
+        const fore  = { x: wr.x - el.x, y: wr.y - el.y };
+        const elbow = angleDeg({ x: -upper.x, y: -upper.y }, fore);
+
+        arrow(sh, el, col[0], 5, 13);
+        arrow(el, wr, col[1], 5, 13);
+        joint(sh, 6); joint(el, 6); joint(wr, 6);
+        label(elbow.toFixed(0) + "\u00b0", el.x + 10, el.y + 5, col[0]);
+      }
+    });
+
+    // ── 손: 전체 관절 + 1:1 그리디 매칭 ──
+    let handCount = 0;
+    if (handsOn && handLm) {
+      const handRes = handLm.detectForVideo(video, ts);
+      const rawHands = (handRes.landmarks || []).map(hl => hl.map(l => ({ x: X(l), y: Y(l) })));
+      handCount = rawHands.length;
+
+      // 모든 (손, 손목) 쌍을 거리순으로 → 한 손목엔 한 손만
+      const pairsList = [];
+      rawHands.forEach((pts, hi) => {
+        for (const wp of wristPool) {
+          const d = Math.hypot(wp.x - pts[0].x, wp.y - pts[0].y);
+          if (d < wp.th) pairsList.push({ hi, wp, d });
+        }
+      });
+      pairsList.sort((a, b) => a.d - b.d);
+      const usedH = new Set(), usedW = new Set(), assign = new Map();
+      for (const pr of pairsList) {
+        const wid = pr.wp.pi + "-" + pr.wp.side;
+        if (usedH.has(pr.hi) || usedW.has(wid)) continue;
+        usedH.add(pr.hi); usedW.add(wid);
+        assign.set(pr.hi, pr.wp);
+      }
+
+      rawHands.forEach((raw, hi) => {
+        const wp = assign.get(hi);
+        const key = wp ? "h" + wp.pi + "-" + wp.side : "free" + hi;
+        let sm = handSm.get(key);
+        if (!sm) { sm = new PointsSmoother(canvas.width * 0.12); handSm.set(key, sm); }
+        const pts = sm.apply(raw, tSec);
+        const col = wp ? PALETTE[wp.pi % PALETTE.length][1] : "#9fb3c8";
+
+        ctx.strokeStyle = col; ctx.lineWidth = 2;            // 손바닥 골격
+        for (const [a, b] of PALM_LINKS) {
+          ctx.beginPath(); ctx.moveTo(pts[a].x, pts[a].y); ctx.lineTo(pts[b].x, pts[b].y); ctx.stroke();
+        }
+        for (const [a, b] of FINGER_BONES) arrow(pts[a], pts[b], col, 3, 7);  // 마디 벡터
+        for (let k = 1; k < 21; k++) joint(pts[k], 2.5);     // 관절 점
+        joint(pts[0], 4);
+        const name = wp ? "P" + (wp.pi + 1) + (wp.side === "R" ? " 오른손" : " 왼손") : "손";
+        label(name, pts[0].x + 8, pts[0].y - 10, col);
+      });
+    }
+
+    hud.hidden = false;
+    hud.textContent = "인원 " + persons.length + "명 · 손 " + handCount + "개 · " + fps.toFixed(0) + "fps";
+    setStatus(persons.length === 0 ? "사람이 안 보여" : "");
+  }
+  requestAnimationFrame(loop);
+}
+
+function camErrMsg(err) {
+  if (err && (err.name === "NotAllowedError" || err.name === "SecurityError"))
+    return "카메라가 막혀 있어. localhost 서버나 file://로 직접 열어줘.";
+  if (err && err.name === "NotFoundError") return "카메라를 못 찾았어.";
+  return "에러: " + (err && err.message ? err.message : err);
+}
+
+document.getElementById("btnStart").onclick = async e => {
+  const btn = e.currentTarget;
+  if (running) { running = false; btn.textContent = "▶ 시작"; setStatus("정지됨"); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("카메라 API가 잠겨 있어 (" + location.protocol +
+      ", secure=" + window.isSecureContext + "). localhost로 열어야 해.");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    setStatus("카메라 여는 중...");
+    await startCam();
+    if (!poseLm) {
+      setStatus("모델 2개 로딩 중... (첫 실행만 몇 초 걸려)");
+      try {
+        const m = await loadModels("GPU");
+        poseLm = m.pose; handLm = m.hand;
+      } catch (_) {
+        const m = await loadModels("CPU");
+        poseLm = m.pose; handLm = m.hand;
+      }
+    }
+    try { await navigator.wakeLock.request("screen"); } catch (_) {}
+    running = true; lastVideoTime = -1;
+    btn.textContent = "⏸ 정지";
+    setStatus("");
+    requestAnimationFrame(loop);
+  } catch (err) {
+    setStatus(camErrMsg(err));
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+document.getElementById("btnFlip").onclick = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  poseSm.clear(); handSm.clear();
+  if (stream) {
+    try { await startCam(); lastVideoTime = -1; }
+    catch (err) { setStatus(camErrMsg(err)); }
+  }
+};
+
+document.getElementById("btnHands").onclick = e => {
+  handsOn = !handsOn;
+  e.currentTarget.textContent = "손가락: " + (handsOn ? "ON" : "OFF");
+};
+</script>
+</body>
+</html>
