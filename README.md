@@ -34,6 +34,7 @@
 | [v7.3](versions/v07.3-robot-control.html) | 2026-07-08 | 첫 로봇 제어판: Web Serial로 아두이노 연결, 서보·그리퍼 제어, 오른팔/좌우반전/모델 선택 | ARM--VECTER |
 | [Multi v4](versions/v04-multi-workers.html) | 2026-06-12 | 자세 인식과 손 인식을 작업 스레드 두 개로 나눠 동시에 처리 | arm-vector- |
 | [Multi v3](versions/v03-multi.html) | 2026-06-12 | 여러 사람·손가락 인식, One Euro 필터로 떨림 감소 | arm-vector-, arm-vectorV3, icdoJ (셋 다 같은 파일) |
+| [Multi v2](versions/v02-multi-fingers.html) | 2026-06-11 | 최대 4명 동시 인식, 손가락 인식 추가, 어깨선 기준으로 손을 사람에게 짝지음 | arm_vector_multi.html (비공개) |
 
 v10.x 파일들은 화면 제목이 모두 "v10.1"로 남아 있어요. 버전 이름은 코드 안의 `[v10.3]` 표시와 파일 이름, 날짜로 붙였어요.
 
@@ -51,7 +52,7 @@ v10.x 파일들은 화면 제목이 모두 "v10.1"로 남아 있어요. 버전 �
 ### 알아 둘 점
 - **v10.3(데모 조정·최종)과 짝인 펌웨어 v7.4는 지금 남아 있지 않아요.** 컴퓨터의 `arm_firmware_v7_4_demo_tuned.ino` 파일 내용이 나중에 EMG 측정용 코드로 덮어써졌어요. v10.3 화면을 v7.3 펌웨어와 쓰면 펌웨어가 ±10° 제한으로 막아서 로봇이 덜 움직이고 CH4는 고정돼요(위험한 쪽은 아님). 데모 범위로 쓰려면 v7.3의 `FIRST_LIVE_TEST_DELTA`를 `{25, 20, 25, 20, 82}`로 바꾼 v7.4를 다시 만들어야 해요.
 - **Multi v4**는 작업 스레드를 모듈 방식으로 띄우는 판이에요. 예전에 이 방식에서 `ModuleFactory not set` 오류가 났고 v4.1에서 고쳤는데, v4.1 파일은 남아 있지 않아요.
-- v1·v2 화면, Python 버전(`arm_vector_camera.py`), v4.1 펌웨어와 같이 쓰던 수동 조종기 HTML도 GitHub에 없어요.
+- v1 화면(한 사람만 인식하던 첫 판), Python 버전(`arm_vector_camera.py`), v4.1 펌웨어와 같이 쓰던 수동 조종기 HTML은 남아 있지 않아요.
 
 ## 파일
 
@@ -64,4 +65,4 @@ v10.x 파일들은 화면 제목이 모두 "v10.1"로 남아 있어요. 버전 �
 화면은 모두 파일 하나로 돌아가요. 카메라를 쓰기 때문에 파일을 직접 열면(file://) 막히니, 꼭 위 웹 주소로 여세요.
 
 ## 저장소 정리 기록 (2026-11-11)
-이 프로젝트의 버전이 저장소 7개와 컴퓨터에 흩어져 있던 것을 여기 하나로 모았어요. 원래 저장소(aVXYVSh, `-`, ARM--VECTER, arm-vector-, arm-vectorV3, icdoJ)는 내용이 모두 `versions/`에 들어 있어요.
+이 프로젝트의 버전이 저장소 7개와 컴퓨터에 흩어져 있던 것을 여기 하나로 모았어요. 원래 저장소(aVXYVSh, `-`, ARM--VECTER, arm-vector-, arm-vectorV3, icdoJ, sodie)는 내용을 모두 `versions/`로 옮긴 뒤 지웠어요.
