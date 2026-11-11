@@ -13,7 +13,8 @@
   body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.55 system-ui, -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
   main { max-width:720px; margin:0 auto; padding:28px 16px 48px; }
   h1 { font-size:1.45rem; margin:0 0 4px; }
-  p.lead { color:var(--sub); margin:0 0 20px; }
+  h2 { font-size:1.05rem; margin:28px 0 10px; color:var(--sub); font-weight:600; }
+  p.lead { color:var(--sub); margin:0 0 8px; }
   a { color:var(--accent); }
   ol { list-style:none; padding:0; margin:0; display:grid; gap:10px; }
   li { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
@@ -28,14 +29,21 @@
 <body>
 <main>
   <h1>Arm Vector 버전 기록</h1>
-  <p class="lead">카메라로 팔 움직임을 벡터로 읽어 로봇팔을 따라 움직이게 하는 프로젝트의 모든 버전이에요. 위가 최신이에요. <a href="../">최신 버전 바로 열기</a></p>
+  <p class="lead">카메라로 팔 움직임을 벡터로 읽어 로봇팔을 따라 움직이게 하는 프로젝트의 모든 화면 버전이에요. 위가 최신이에요. <a href="../">최신 버전 바로 열기</a></p>
+  <p class="lead">'복원' 표시는 Claude 대화에 남은 수정 기록으로 다시 만든 파일이에요.</p>
+
+  <h2>로봇 제어판 (v7 ~ v10)</h2>
   <ol>
-    <li><div class="top"><a class="ver" href="v10.3-final.html">v10.3 최종 (발표 시연판)</a><span class="date">2026-07-16</span><span class="tag">최신</span></div>
-      <p class="desc">데모 조정판에 더해, 시작 자세가 거의 맞으면 시동이 걸리도록 기준을 느슨하게 함.</p></li>
+    <li><div class="top"><a class="ver" href="v10.4-start-modes.html">v10.4 시동 3모드</a><span class="date">2026-07-16</span><span class="tag">최신</span><span class="tag">복원</span></div>
+      <p class="desc">발표 최종판. 엔터 즉시 / 손목만 확인 / 전체 자세 맞춤 중 골라 시동, 아두이노 자동 재연결. 펌웨어 v7.4와 짝.</p></li>
+    <li><div class="top"><a class="ver" href="v10.3-final.html">v10.3 최종</a><span class="date">2026-07-16</span></div>
+      <p class="desc">시작 자세가 거의 맞으면 시동이 걸리도록 기준을 느슨하게 함.</p></li>
     <li><div class="top"><a class="ver" href="v10.3-demo-tuned.html">v10.3 데모 조정</a><span class="date">2026-07-16</span></div>
       <p class="desc">손목 축회전 ±80° 켬, 데모용으로 움직임 범위 확대, 손목 상하 방향 반전 수정.</p></li>
-    <li><div class="top"><a class="ver" href="v10.2-simple-enable.html">v10.2 첫 실기 제한모드</a><span class="date">2026-07-15</span></div>
-      <p class="desc">사람 관절 각도를 로봇 서보 각도로 바로 바꾸는 진짜 미러링. 오른팔 기준값 수집, PWM 한 번에 켜기·긴급정지, 첫 실기용 움직임 제한. 펌웨어 v7.3과 짝.</p></li>
+    <li><div class="top"><a class="ver" href="v10.2-simple-enable.html">v10.2</a><span class="date">2026-07-16</span></div>
+      <p class="desc">PWM 한 번에 켜기. 펌웨어 v7.3과 짝.</p></li>
+    <li><div class="top"><a class="ver" href="v10.1-right-arm-baseline.html">v10.1 오른팔 기준값</a><span class="date">2026-07-16</span><span class="tag">복원</span></div>
+      <p class="desc">사람 관절 각도를 로봇 서보 각도로 바로 바꾸는 진짜 미러링의 시작. 오른팔 기준값 수집, 첫 실기용 움직임 제한. 펌웨어 v7.2와 짝.</p></li>
     <li><div class="top"><a class="ver" href="v09.7-hand-gate.html">v9.7 손 게이트 완화 · 기준 잠금</a><span class="date">2026-07-15</span></div>
       <p class="desc">손을 너무 쉽게 버리던 기준을 풀고, 1번 기준자세가 잠겨야 다음 단계로 넘어감. 빈 값(null)을 0으로 보던 버그 수정.</p></li>
     <li><div class="top"><a class="ver" href="v08.7.0-joint-rom.html">v8.7.0 관절축 순차 가동범위</a><span class="date">2026-07-13</span></div>
@@ -44,12 +52,22 @@
       <p class="desc">v7.3에 인물 고정 기능 추가.</p></li>
     <li><div class="top"><a class="ver" href="v07.3-robot-control.html">v7.3 Robot Control</a><span class="date">2026-07-08</span></div>
       <p class="desc">브라우저에서 아두이노로 바로 연결(Web Serial)해 서보와 그리퍼를 움직이는 첫 로봇 제어판.</p></li>
+  </ol>
+
+  <h2>카메라 인식 (v1 ~ Multi v4.1)</h2>
+  <ol>
+    <li><div class="top"><a class="ver" href="v04.1-multi-workers-fix.html">Multi v4.1</a><span class="date">2026-06-12</span><span class="tag">복원</span></div>
+      <p class="desc">작업 스레드를 일반 방식으로 바꿔 'ModuleFactory not set' 오류 수정.</p></li>
     <li><div class="top"><a class="ver" href="v04-multi-workers.html">Multi v4 (Workers)</a><span class="date">2026-06-12</span></div>
       <p class="desc">자세 인식과 손 인식을 작업 스레드 두 개로 나눠 동시에 처리.</p></li>
     <li><div class="top"><a class="ver" href="v03-multi.html">Multi v3</a><span class="date">2026-06-12</span></div>
-      <p class="desc">여러 사람과 손가락까지 인식하고, One Euro 필터로 떨림을 줄인 판.</p></li>
+      <p class="desc">One Euro 필터로 떨림을 줄인 판.</p></li>
+    <li><div class="top"><a class="ver" href="v02.1-multi.html">Multi v2.1</a><span class="date">2026-06-11</span></div>
+      <p class="desc">v2를 다듬은 판. v3의 바탕.</p></li>
     <li><div class="top"><a class="ver" href="v02-multi-fingers.html">Multi v2 (+ Fingers)</a><span class="date">2026-06-11</span></div>
       <p class="desc">최대 4명 동시 인식과 손가락 인식을 처음 넣은 판.</p></li>
+    <li><div class="top"><a class="ver" href="v01-mobile.html">v1 Mobile</a><span class="date">2026-06-11</span></div>
+      <p class="desc">첫 웹판. 한 사람의 팔 벡터를 폰 브라우저에서 표시.</p></li>
   </ol>
   <footer>카메라를 쓰기 때문에 꼭 이 웹 주소(https)로 여세요. 파일을 직접 열면 카메라가 막혀요.</footer>
 </main>

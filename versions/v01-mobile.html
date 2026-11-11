@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Arm Vector — Mobile</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:system-ui,sans-serif; background:#0b0f14; color:#e8eef4;
+         height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
+  #stage { position:relative; flex:1; min-height:0; background:#000; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  video.mirror { transform:scaleX(-1); }
+  #hud { position:absolute; top:8px; left:8px; right:8px;
+         font:12px/1.6 ui-monospace,monospace; white-space:pre;
+         background:rgba(0,0,0,.45); border-radius:10px; padding:8px 10px; pointer-events:none; }
+  .up { color:#ffb14e; } .fo { color:#6cf08a; }
+  #status { position:absolute; bottom:10px; left:0; right:0; text-align:center;
+            font-size:13px; color:#cfe0f0; text-shadow:0 1px 3px #000; padding:0 14px; }
+  #bar { display:flex; gap:8px; padding:10px;
+         padding-bottom:calc(10px + env(safe-area-inset-bottom)); background:#11161d; }
+  button { flex:1; padding:13px 0; font-size:14px; font-weight:600; color:#e8eef4;
+           background:#1d2632; border:1px solid #2c3947; border-radius:12px; }
+  button:active { background:#2a3645; }
+  button:disabled { opacity:.5; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+  <div id="hud" hidden></div>
+  <div id="status">▶ 시작을 누르면 카메라 권한을 물어봐</div>
+</div>
+<div id="bar">
+  <button id="btnStart">▶ 시작</button>
+  <button id="btnFlip">카메라 전환</button>
+  <button id="btnArm">팔: 오른팔</button>
+</div>
+
+<script>
+// 자가 진단: 보안 컨텍스트가 아니면 카메라 API 자체가 잠긴다 (권한과 무관)
+window.addEventListener("load", function () {
+  var st = document.getElementById("status");
+  if (!window.isSecureContext) {
+    st.textContent = "\u26a0 \uc774 \uc8fc\uc18c(" + location.protocol +
+      ")\uc5d0\uc120 \uce74\uba54\ub77c API\uac00 \uc7a0\uaca8 \uc788\uc5b4. \uc8fc\uc18c\ucc3d\uc5d0 file:///sdcard/Download/arm_vector_mobile.html \uc744 \uc9c1\uc811 \uc785\ub825\ud558\uac70\ub098 localhost \uc11c\ubc84\ub85c \uc5f4\uc5b4\uc918.";
+  }
+  setTimeout(function () {
+    if (!window.__armOK) {
+      st.textContent = "\u26a0 \uc2a4\ud06c\ub9bd\ud2b8 \ub85c\ub4dc \uc2e4\ud328 \u2014 \uc778\ud130\ub137 \uc5f0\uacb0(CDN \uc811\uc18d)\uc744 \ud655\uc778\ud574\uc918.";
+    }
+  }, 3500);
+});
+</script>
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+window.__armOK = true;
+
+const video = document.getElementById("cam");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const statusEl = document.getElementById("status");
+const setStatus = t => { statusEl.textContent = t; };
+
+// MediaPipe Pose 랜드마크 인덱스 (사람 본인 기준 좌/우)
+const IDX = { right:{ sh:12, el:14, wr:16 }, left:{ sh:11, el:13, wr:15 } };
+
+let landmarker = null, stream = null, running = false;
+let facing = "user";          // user = 전면(셀카), environment = 후면
+let arm = "right";
+let lastVideoTime = -1;
+let fps = 0, tPrev = performance.now();
+
+async function loadModel(delegate) {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  return PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate
+    },
+    runningMode: "VIDEO",
+    numPoses: 1
+  });
+}
+
+async function startCam() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  video.classList.toggle("mirror", facing === "user");
+  await new Promise(r => {
+    if (video.readyState >= 1) return r();
+    video.onloadedmetadata = () => r();
+  });
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+}
+
+function arrow(a, b, color) {
+  const head = Math.max(12, canvas.width * 0.014);
+  const ang = Math.atan2(b.y - a.y, b.x - a.x);
+  ctx.strokeStyle = color; ctx.fillStyle = color;
+  ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(b.x, b.y);
+  ctx.lineTo(b.x - head * Math.cos(ang - 0.45), b.y - head * Math.sin(ang - 0.45));
+  ctx.lineTo(b.x - head * Math.cos(ang + 0.45), b.y - head * Math.sin(ang + 0.45));
+  ctx.closePath(); ctx.fill();
+}
+
+function joint(p) {
+  ctx.fillStyle = "#fff"; ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+}
+
+function angleDeg(v1, v2) {
+  const dot = v1.x * v2.x + v1.y * v2.y;
+  const n = Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y) + 1e-9;
+  return Math.acos(Math.min(1, Math.max(-1, dot / n))) * 180 / Math.PI;
+}
+
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const now = performance.now();
+    fps = fps * 0.9 + (1000 / (now - tPrev)) * 0.1;
+    tPrev = now;
+
+    const lms = res.landmarks && res.landmarks[0];
+    if (lms) {
+      // 전면 카메라는 거울 표시라 x를 뒤집어서 영상과 일치시킴
+      const X = l => (facing === "user" ? 1 - l.x : l.x) * canvas.width;
+      const Y = l => l.y * canvas.height;
+      const i = IDX[arm];
+      const sh = { x: X(lms[i.sh]), y: Y(lms[i.sh]) };
+      const el = { x: X(lms[i.el]), y: Y(lms[i.el]) };
+      const wr = { x: X(lms[i.wr]), y: Y(lms[i.wr]) };
+
+      // 벡터 치환 (화면 좌표계: y는 아래로 증가)
+      const upper = { x: el.x - sh.x, y: el.y - sh.y };
+      const fore  = { x: wr.x - el.x, y: wr.y - el.y };
+      const elbow = angleDeg({ x: -upper.x, y: -upper.y }, fore);
+      const shoulder = Math.atan2(upper.y, upper.x) * 180 / Math.PI;
+
+      arrow(sh, el, "#ffa14e");   // 상완
+      arrow(el, wr, "#56e07a");   // 전완
+      joint(sh); joint(el); joint(wr);
+
+      hud.hidden = false;
+      hud.innerHTML =
+        '<span class="up">상완 (' + upper.x.toFixed(0) + ', ' + upper.y.toFixed(0) +
+        ')  크기 ' + Math.hypot(upper.x, upper.y).toFixed(0) + 'px</span>\n' +
+        '<span class="fo">전완 (' + fore.x.toFixed(0) + ', ' + fore.y.toFixed(0) +
+        ')  크기 ' + Math.hypot(fore.x, fore.y).toFixed(0) + 'px</span>\n' +
+        '팔꿈치 ' + elbow.toFixed(1) + '\u00b0  어깨 ' + shoulder.toFixed(1) +
+        '\u00b0  ' + fps.toFixed(0) + 'fps';
+      setStatus("");
+    } else {
+      hud.hidden = true;
+      setStatus("팔이 안 보여 — 어깨~손목이 프레임 안에 들어오게");
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+function camErrMsg(err) {
+  if (err && (err.name === "NotAllowedError" || err.name === "SecurityError"))
+    return "카메라가 막혀 있어. Claude 미리보기 안이라면 파일을 저장해서 Chrome으로 직접 열어줘.";
+  if (err && err.name === "NotFoundError") return "카메라를 못 찾았어.";
+  return "에러: " + (err && err.message ? err.message : err);
+}
+
+document.getElementById("btnStart").onclick = async e => {
+  const btn = e.currentTarget;
+  if (running) { running = false; btn.textContent = "▶ 시작"; setStatus("정지됨"); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("\uce74\uba54\ub77c API\uac00 \uc7a0\uaca8 \uc788\uc5b4 (" + location.protocol +
+      ", secure=" + window.isSecureContext + "). file:// \uc9c1\uc811 \uc785\ub825 \ub610\ub294 localhost\ub85c \uc5f4\uc5b4\uc57c \ud574.");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    setStatus("카메라 여는 중...");
+    await startCam();
+    if (!landmarker) {
+      setStatus("모델 로딩 중... (첫 실행만 몇 초 걸려)");
+      try { landmarker = await loadModel("GPU"); }
+      catch { landmarker = await loadModel("CPU"); }
+    }
+    try { await navigator.wakeLock.request("screen"); } catch (_) {}
+    running = true; lastVideoTime = -1;
+    btn.textContent = "⏸ 정지";
+    setStatus("");
+    requestAnimationFrame(loop);
+  } catch (err) {
+    setStatus(camErrMsg(err));
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+document.getElementById("btnFlip").onclick = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  if (stream) {
+    try { await startCam(); lastVideoTime = -1; }
+    catch (err) { setStatus(camErrMsg(err)); }
+  }
+};
+
+document.getElementById("btnArm").onclick = e => {
+  arm = arm === "right" ? "left" : "right";
+  e.currentTarget.textContent = "팔: " + (arm === "right" ? "오른팔" : "왼팔");
+};
+</script>
+</body>
+</html>

@@ -72,6 +72,7 @@
   <button id="btnQuality">모델: Heavy</button>
   <button id="btnLock">🔒 인물 고정</button>
   <button id="btnCalib">📍 자세 등록</button>
+  <button id="btnTrigMode">시동: 엔터즉시</button>
   <button id="btnDiag">🔬 진단 모드</button>
   <button id="btnRom">📐 최고 가동범위</button>
   <button id="btnRobot">🤖 로봇 연결</button>
@@ -1427,7 +1428,13 @@ let poseMatch=0,matchHoldStart=0;
 // [v10.3] 시동 일치도 완화: 무대/실기에서 '거의 맞는데 완벽히는 안 됨' 방지.
 //   임계 0.82→0.6, tolerance 약 1.6배 확대(하드게이트도 이 값을 쓰므로 함께 완화), 유지 800→600ms.
 //   ※ 시동돼도 로봇은 FIRST_LIVE ±범위 안이라 살짝 어긋나게 시동돼도 위험하지 않음.
-const POSE_MATCH_TOLERANCE=[30,28,24,22,28],POSE_MATCH_THRESHOLD=.55,POSE_MATCH_HOLD=600;
+const POSE_MATCH_TOLERANCE=[46,44,40,36,44],POSE_MATCH_THRESHOLD=.25,POSE_MATCH_HOLD=500;
+// [v10.4] 시동 모드 3종. 절대각 매핑이라 CH0~2는 아무 자세나 알아서 맞으므로,
+//   기본은 '엔터즉시'(현재 자세를 기준으로 즉시 등록+시동, 대기 없음)로 둔다.
+//   instant=엔터 누른 순간 동기화+시동 / wrist=손목(CH3·4)만 일치 확인 / full=5축 전체 확인
+let triggerMode='instant';
+const TRIGGER_MODES=['instant','wrist','full'];
+const TRIGGER_LABEL={instant:'시동: 엔터즉시',wrist:'시동: 손목확인',full:'시동: 전체자세'};
 const rawDefaultRef=[...UNIFIED_START_RAW];
 let lastRawAngles=Array(AXIS_COUNT).fill(null);
 function clamp(v,lo,hi){return v<lo?lo:(v>hi?hi:v);}
@@ -1439,8 +1446,10 @@ function computePoseMatch(raw){
   if(!raw.every(Number.isFinite)) return 0;
   if((lastHandQuality??0)<DIAG_HAND_QUALITY_MIN||(lastWristFrameQuality??0)<WRIST_FRAME_MIN_REGISTER) return 0;
   const weights=[1,1,1,.65,.65];
+  // [v10.4] wrist 모드: 손목(CH3·CH4)만 확인 — 몸통 자세(CH0~2)는 절대각이라 아무 자세나 OK.
+  const idxs = triggerMode==='wrist' ? [3,4] : [0,1,2,3,4];
   let total=0,count=0;
-  for(let i=0;i<AXIS_COUNT;i++){
+  for(const i of idxs){
     const d=i===0?Math.abs(V.wrap180(raw[i]-refPose[i])):Math.abs(raw[i]-refPose[i]);
     if(d>POSE_MATCH_TOLERANCE[i]) return 0;  // 평균점수로 한 축 큰 오차가 숨는 것 차단
     total+=Math.max(0,1-d/POSE_MATCH_TOLERANCE[i])*weights[i];count+=weights[i];
@@ -2297,15 +2306,34 @@ async function sendRaw(str){
   if(!serialWriter) throw new Error('시리얼 writer 없음');
   await serialWriter.write(new TextEncoder().encode(str));
 }
+const ARDUINO_VIDS=[0x2341,0x2A03,0x1A86,0x0403,0x10C4,0x1B4F];  // Arduino/CH340/FTDI/CP210x 계열
 async function connectRobot(){
   if(!hardwareConfigValid()){setStatus('🔒 하드웨어 보정값 검증 실패 — 연결 차단');return;}
   if(!('serial' in navigator)){setStatus('⚠ Web Serial 미지원 — 크롬/엣지 데스크톱 필요');return;}
-  try{serialPort=await navigator.serial.requestPort();}
-  catch(err){setStatus('포트 선택 취소됨');return;}
+  serialPort=null; let autoPicked=false;
+  // [v10.4] COM 번호가 바뀌어도(COM3→COM6 등) 이전에 승인한 아두이노를 기억해 자동 재연결.
+  try{
+    const ports=await navigator.serial.getPorts();
+    const known=ports.find(p=>{const info=(p.getInfo&&p.getInfo())||{};return ARDUINO_VIDS.includes(info.usbVendorId);})||ports[0];
+    if(known){serialPort=known;autoPicked=true;}
+  }catch(e){}
+  // 기억된 포트가 없으면 아두이노 계열만 걸러 선택창을 띄운다(그래도 안 뜨면 전체 목록).
+  if(!serialPort){
+    try{serialPort=await navigator.serial.requestPort({filters:ARDUINO_VIDS.map(v=>({usbVendorId:v}))});}
+    catch(err){
+      try{serialPort=await navigator.serial.requestPort();}
+      catch(e2){setStatus('포트 선택 취소됨');return;}
+    }
+  }
   try{await serialPort.open({baudRate:115200});}
   catch(err){
-    setStatus(String(err).match(/locked|in use|Failed to open/i)?'⚠ 포트 사용 중 — Arduino 시리얼 모니터를 닫으세요':'포트 열기 실패: '+err.message);
-    try{await serialPort.close();}catch(e){}serialPort=null;return;
+    if(autoPicked){  // 기억한 포트가 지금은 다른 장치일 수 있으니 선택창으로 폴백
+      try{serialPort=await navigator.serial.requestPort();await serialPort.open({baudRate:115200});}
+      catch(e2){setStatus('포트 열기 실패 — 아두이노를 다시 꽂고 재시도(시리얼 모니터는 닫기)');try{if(serialPort)await serialPort.close();}catch(e3){}serialPort=null;return;}
+    }else{
+      setStatus(String(err).match(/locked|in use|Failed to open/i)?'⚠ 포트 사용 중 — Arduino 시리얼 모니터를 닫으세요':'포트 열기 실패: '+err.message);
+      try{await serialPort.close();}catch(e){}serialPort=null;return;
+    }
   }
   try{
     serialWriter=serialPort.writable.getWriter();
@@ -2568,10 +2596,33 @@ function disarmSystem(){
   setStatus("⏸ 대기 — 0.9초 홀드 → 5초 STOW 복귀 → 약 15초 PWM 자동 OFF");
   setTimeout(()=>{$status.style.opacity=0;},1800);
 }
+// [v10.4] 즉시 동기화 시동: 지금 자세를 기준으로 등록하고 바로 추적. 자세일치 대기 없음.
+//   절대각(CH0~2)이라 아무 자세나 OK. 손바닥만 화면을 향하면(손목 인식) 된다.
+function instantArm(){
+  if(!hardwareConfigValid()){setStatus("🔒 하드웨어 보정 미완 — 시동 차단");return;}
+  if(romActive){setStatus("측정 중에는 시동할 수 없습니다");return;}
+  if(!running){setStatus("먼저 카메라를 시작하세요");return;}
+  if(!robotConnected){setStatus("먼저 로봇을 연결하세요 (🤖)");return;}
+  if(!robotPwmEnabled){setStatus("PWM이 OFF입니다 — ⚡ PWM 켜기 먼저");return;}
+  if(!lastRawAngles.slice(0,3).every(Number.isFinite)){setStatus("🔴 팔 인식이 불안정 — 상체가 다 보이게 하고 다시");return;}
+  if((lastHandQuality??0)<DIAG_HAND_QUALITY_MIN||(lastWristFrameQuality??0)<WRIST_FRAME_MIN_REGISTER){
+    setStatus("🔴 손목/손 인식 불안정 — 손바닥이 화면을 향하게 하고 다시");return;
+  }
+  if(!setWristReferenceFromCurrent()){setStatus("손목 기준 저장 실패 — 손이 잘 보이게 다시");return;}
+  refPose=[lastRawAngles[0],lastRawAngles[1],lastRawAngles[2],0,0];
+  calibRef=[...refPose];
+  try{localStorage.setItem(REFPOSE_STORAGE_KEY,JSON.stringify({version:'v10.1-right-arm-baseline',arm:'right',raw:refPose}));}catch(e){}
+  $btnCalib.textContent='📍 오른팔 기준 등록됨';$btnCalib.classList.add('on');
+  resetCommandSafety(ROBOT_STOW_POSE);
+  sysState='active';matchHoldStart=0;
+  setStatus('✅ 즉시 동기화 + 시동! 지금 이 자세를 기준으로 팔을 따라갑니다');
+  setTimeout(()=>{$status.style.opacity=0;},1800);
+}
 // 상태 토글 (시동 트리거 키/박수가 부름)
 function toggleArm(){
-  if(sysState==='idle') armSystem();
-  else disarmSystem();  // arming이나 active면 대기로
+  if(sysState!=='idle'){ disarmSystem(); return; }  // arming/active면 대기로
+  if(triggerMode==='instant') instantArm();          // 즉시 동기화+시동
+  else armSystem();                                   // wrist/full = 자세일치 대기
 }
 
 $btnLock.onclick=()=>{
@@ -2604,6 +2655,19 @@ $btnLock.onclick=()=>{
     setStatus("이 사람에게 고정됨 — 타인이 들어와도 유지");
     setTimeout(()=>{$status.style.opacity=0;},1500);
   }
+};
+
+const $btnTrigMode=document.getElementById("btnTrigMode");
+$btnTrigMode.textContent=TRIGGER_LABEL[triggerMode];
+$btnTrigMode.onclick=()=>{
+  const i=(TRIGGER_MODES.indexOf(triggerMode)+1)%TRIGGER_MODES.length;
+  triggerMode=TRIGGER_MODES[i];
+  $btnTrigMode.textContent=TRIGGER_LABEL[triggerMode];
+  const hint={instant:'엔터 누른 순간 현재 자세로 즉시 동기화+시동 (대기·자세일치 없음)',
+              wrist:'손목(손바닥 방향)만 맞으면 시동 — 몸통은 아무 자세나 OK',
+              full:'5축 전체 자세가 맞아야 시동 (가장 엄격)'}[triggerMode];
+  setStatus('🎛 '+TRIGGER_LABEL[triggerMode]+' — '+hint);
+  setTimeout(()=>{$status.style.opacity=0;},2400);
 };
 
 if(refPose&&wristReferenceQuat){$btnCalib.textContent='📍 오른팔 기준 등록됨';$btnCalib.classList.add('on');}
